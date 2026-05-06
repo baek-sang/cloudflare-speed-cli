@@ -4,6 +4,7 @@ mod export;
 mod help;
 mod history;
 mod state;
+mod traceroute;
 
 pub use state::UiState;
 
@@ -79,6 +80,8 @@ pub async fn run(args: Cli) -> Result<()> {
         .and_then(|n| n.to_str())
         .map(|s| s.to_string());
     state.proxy_url = args.proxy.clone();
+    state.traceroute_enabled = args.traceroute;
+    state.traceroute_max_hops = args.traceroute_max_hops;
 
     // Spawn background task to check for updates (non-blocking, silent on error)
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -269,6 +272,7 @@ pub async fn run(args: Cli) -> Result<()> {
                                 state.tls_summary = None;
                                 state.ip_comparison = None;
                                 state.traceroute_summary = None;
+                                state.traceroute_hops.clear();
                                 run_ctx = Some(start_run(&args).await?);
                             }
                         }
@@ -350,7 +354,8 @@ pub async fn run(args: Cli) -> Result<()> {
                         }
                         (KeyModifiers::SHIFT, KeyCode::BackTab) => {
                             // Shift+Tab cycles backwards
-                            let new_tab = if state.tab == 0 { 3 } else { state.tab - 1 };
+                            let tab_count = if state.traceroute_enabled { 5 } else { 4 };
+                            let new_tab = if state.tab == 0 { tab_count - 1 } else { state.tab - 1 };
                             state.tab = new_tab;
                             if new_tab == 1 {
                                 state.history_selected = 0;
@@ -358,7 +363,8 @@ pub async fn run(args: Cli) -> Result<()> {
                             }
                         }
                         (_, KeyCode::Tab) => {
-                            let new_tab = (state.tab + 1) % 4;
+                            let tab_count = if state.traceroute_enabled { 5 } else { 4 };
+                            let new_tab = (state.tab + 1) % tab_count;
                             state.tab = new_tab;
                             // Reset history selection when switching to history tab
                             if new_tab == 1 {
@@ -367,7 +373,7 @@ pub async fn run(args: Cli) -> Result<()> {
                             }
                         }
                         (_, KeyCode::Char('?')) => {
-                            state.tab = 3; // help
+                            state.tab = if state.traceroute_enabled { 4 } else { 3 }; // help
                         }
                         // History navigation and deletion (only when on History tab)
                         (_, KeyCode::Up) | (_, KeyCode::Char('k')) => {
@@ -885,6 +891,7 @@ fn apply_event(state: &mut UiState, ev: TestEvent) {
                 .map(|r| format!("{:.1}ms", r))
                 .unwrap_or_else(|| "*".to_string());
             state.info = format!("Traceroute hop {}: {} {}", hop_number, addr, rtt);
+            state.traceroute_hops.push(hop);
         }
         TestEvent::TracerouteComplete { summary } => {
             state.info = format!(
@@ -907,12 +914,17 @@ fn draw(area: Rect, f: &mut ratatui::Frame, state: &mut UiState) {
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(area);
 
-    let tabs = Tabs::new(vec![
+    let mut tab_titles: Vec<Line> = vec![
         Line::from("Dashboard"),
         Line::from("History"),
-        Line::from("Charts"),
-        Line::from("Help"),
-    ])
+    ];
+    if state.traceroute_enabled {
+        tab_titles.push(Line::from("Traceroute"));
+    }
+    tab_titles.push(Line::from("Charts"));
+    tab_titles.push(Line::from("Help"));
+
+    let tabs = Tabs::new(tab_titles)
     .select(state.tab)
     .block(
         Block::default()
@@ -929,6 +941,9 @@ fn draw(area: Rect, f: &mut ratatui::Frame, state: &mut UiState) {
     .highlight_style(Style::default().fg(Color::Yellow));
     f.render_widget(tabs, chunks[0]);
 
+    let traceroute_idx: Option<usize> = if state.traceroute_enabled { Some(2) } else { None };
+    let charts_idx: usize = if state.traceroute_enabled { 3 } else { 2 };
+
     match state.tab {
         0 => draw_dashboard(chunks[1], f, state),
         1 => {
@@ -938,7 +953,8 @@ fn draw(area: Rect, f: &mut ratatui::Frame, state: &mut UiState) {
                 show_history(chunks[1], f, &mut *state)
             }
         }
-        2 => draw_charts(chunks[1], f, state),
+        i if Some(i) == traceroute_idx => traceroute::draw_traceroute(chunks[1], f, state),
+        i if i == charts_idx => draw_charts(chunks[1], f, state),
         _ => draw_help(chunks[1], f),
     }
 }

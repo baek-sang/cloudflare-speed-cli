@@ -1,4 +1,4 @@
-use crate::model::{DnsSummary, IpVersionComparison, Phase, RunResult, TlsSummary, TracerouteSummary};
+use crate::model::{DnsSummary, IpVersionComparison, Phase, RunResult, TlsSummary, TracerouteHop, TracerouteSummary};
 use ratatui::{
     style::Color,
     style::Style,
@@ -89,6 +89,9 @@ pub struct UiState {
     pub tls_summary: Option<TlsSummary>,
     pub ip_comparison: Option<IpVersionComparison>,
     pub traceroute_summary: Option<TracerouteSummary>,
+    pub traceroute_enabled: bool,
+    pub traceroute_max_hops: u8,
+    pub traceroute_hops: Vec<TracerouteHop>,
     /// None = check not completed, Some(None) = on latest, Some(Some(v)) = update available
     pub update_status: Option<Option<String>>,
 }
@@ -167,6 +170,9 @@ impl Default for UiState {
             tls_summary: None,
             ip_comparison: None,
             traceroute_summary: None,
+            traceroute_enabled: false,
+            traceroute_max_hops: 30,
+            traceroute_hops: Vec::new(),
             update_status: None,
         }
     }

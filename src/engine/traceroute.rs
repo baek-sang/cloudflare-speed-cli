@@ -248,15 +248,11 @@ async fn run_system_traceroute(
     let dest_ip_str = destination_ip.to_string();
 
     // Determine which command to use based on OS
+    // Note: -n / -d intentionally NOT passed so the OS resolves hostnames.
     let (cmd, args): (&'static str, Vec<String>) = if cfg!(target_os = "windows") {
         (
             "tracert",
-            vec![
-                "-h".to_string(),
-                max_hops.to_string(),
-                "-d".to_string(),
-                dest.clone(),
-            ],
+            vec!["-h".to_string(), max_hops.to_string(), dest.clone()],
         )
     } else {
         (
@@ -264,7 +260,6 @@ async fn run_system_traceroute(
             vec![
                 "-m".to_string(),
                 max_hops.to_string(),
-                "-n".to_string(),
                 "-q".to_string(),
                 "3".to_string(),
                 dest.clone(),
@@ -276,6 +271,15 @@ async fn run_system_traceroute(
         .await
         .context("Traceroute task failed")?
         .context("Failed to execute traceroute command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "traceroute exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let hops = parse_traceroute_output(&stdout, event_tx).await;
@@ -331,16 +335,19 @@ async fn parse_traceroute_output(
 }
 
 /// Parse a single hop line from traceroute output.
+///
+/// Handles three formats:
+/// - Linux/macOS with DNS:    `1  host.name (1.2.3.4)  0.5 ms 0.4 ms 0.6 ms`
+/// - Linux/macOS without DNS: `1  1.2.3.4  0.5 ms 0.4 ms 0.6 ms`
+/// - Windows with DNS:        `1  <1 ms <1 ms <1 ms  host.name [1.2.3.4]`
 fn parse_hop_line(line: &str) -> Option<TracerouteHop> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return None;
     }
 
-    // First part should be hop number
     let hop_number: u8 = parts.first()?.parse().ok()?;
 
-    // Check for timeout line (all asterisks)
     if parts.iter().skip(1).all(|p| *p == "*") {
         return Some(TracerouteHop {
             hop_number,
@@ -351,37 +358,44 @@ fn parse_hop_line(line: &str) -> Option<TracerouteHop> {
         });
     }
 
-    // Find IP address and RTT values
     let mut ip_address: Option<String> = None;
+    let mut hostname: Option<String> = None;
     let mut rtts: Vec<f64> = Vec::new();
+    let mut prev_candidate: Option<String> = None;
 
     for part in parts.iter().skip(1) {
-        // Skip "ms" markers
         if *part == "ms" {
             continue;
         }
 
-        // Try to parse as RTT (number)
-        if let Ok(rtt) = part.trim_end_matches("ms").parse::<f64>() {
+        // Numeric RTT (handles plain `0.5`, `0.5ms`, and Windows `<1`).
+        let cleaned = part.trim_start_matches('<').trim_end_matches("ms");
+        if let Ok(rtt) = cleaned.parse::<f64>() {
             rtts.push(rtt);
+            prev_candidate = None;
             continue;
         }
 
-        // Handle Windows "<1 ms" format
-        if part.starts_with('<') {
-            if let Ok(rtt) = part
-                .trim_start_matches('<')
-                .trim_end_matches("ms")
-                .parse::<f64>()
-            {
-                rtts.push(rtt);
-                continue;
-            }
-        }
+        let was_wrapped = part.starts_with('(') || part.starts_with('[');
+        let stripped = part
+            .trim_start_matches(['(', '['])
+            .trim_end_matches([')', ']']);
 
-        // Try to parse as IP address
-        if part.parse::<IpAddr>().is_ok() || (part.contains('.') && !part.contains("ms")) {
-            ip_address = Some(part.to_string());
+        if stripped.parse::<IpAddr>().is_ok() {
+            if ip_address.is_none() {
+                ip_address = Some(stripped.to_string());
+                if was_wrapped {
+                    if let Some(prev) = prev_candidate.take() {
+                        if prev != stripped {
+                            hostname = Some(prev);
+                        }
+                    }
+                }
+            }
+            prev_candidate = None;
+        } else {
+            // Not an IP, not a number: candidate hostname for the next wrapped IP.
+            prev_candidate = Some(part.to_string());
         }
     }
 
@@ -392,8 +406,71 @@ fn parse_hop_line(line: &str) -> Option<TracerouteHop> {
     Some(TracerouteHop {
         hop_number,
         ip_address,
-        hostname: None,
+        hostname,
         rtt_ms: rtts,
         timeout: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_linux_with_hostname() {
+        let line = " 1  host.example.com (1.2.3.4)  0.5 ms  0.4 ms  0.6 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.hop_number, 1);
+        assert_eq!(hop.ip_address.as_deref(), Some("1.2.3.4"));
+        assert_eq!(hop.hostname.as_deref(), Some("host.example.com"));
+        assert_eq!(hop.rtt_ms, vec![0.5, 0.4, 0.6]);
+        assert!(!hop.timeout);
+    }
+
+    #[test]
+    fn parses_linux_without_dns() {
+        let line = " 2  1.2.3.4  0.5 ms 0.4 ms 0.6 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("1.2.3.4"));
+        assert_eq!(hop.hostname, None);
+        assert_eq!(hop.rtt_ms, vec![0.5, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn parses_linux_when_hostname_equals_ip() {
+        // When DNS fails, traceroute often shows `ip (ip)` with both being identical.
+        let line = " 3  10.0.0.1 (10.0.0.1)  5.2 ms 4.8 ms 5.1 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("10.0.0.1"));
+        assert_eq!(hop.hostname, None, "hostname should be elided when same as ip");
+    }
+
+    #[test]
+    fn parses_timeout_line() {
+        let line = " 5  * * *";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address, None);
+        assert_eq!(hop.hostname, None);
+        assert!(hop.timeout);
+        assert!(hop.rtt_ms.is_empty());
+    }
+
+    #[test]
+    fn parses_windows_with_hostname() {
+        let line = "  1    <1 ms    <1 ms    <1 ms  router.local [192.168.1.1]";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("192.168.1.1"));
+        assert_eq!(hop.hostname.as_deref(), Some("router.local"));
+        assert_eq!(hop.rtt_ms, vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn first_ip_wins_on_multi_router_hop() {
+        // Some hops have two routers responding; we keep the first IP/hostname pair.
+        let line = " 5  a.example.com (1.1.1.1)  260.2 ms b.example.com (2.2.2.2)  260.1 ms 260.0 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("1.1.1.1"));
+        assert_eq!(hop.hostname.as_deref(), Some("a.example.com"));
+        assert_eq!(hop.rtt_ms.len(), 3);
+    }
 }
