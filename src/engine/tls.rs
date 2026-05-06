@@ -30,6 +30,12 @@ pub async fn measure_tls_handshake(
     // Create root certificate store from webpki-roots, plus any user-supplied CA.
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    // Native stores can include legacy certs rustls won't parse; skip those rather than failing.
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = root_store.add(cert);
+    }
+
     if let Some(path) = cert_path {
         for cert in super::cert::load_rustls_certificates(path)? {
             root_store

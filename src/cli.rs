@@ -89,7 +89,7 @@ pub struct Cli {
     #[arg(long)]
     pub proxy: Option<String>,
 
-    /// Path to a custom TLS certificate file (PEM or DER format)
+    /// Path to a custom TLS certificate file (PEM or DER format). Not needed if the CA is already trusted by your OS truststore.
     #[arg(long)]
     pub certificate: Option<std::path::PathBuf>,
 
