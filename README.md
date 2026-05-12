@@ -51,6 +51,14 @@ brew tap kavehtehrani/tap
 brew install cloudflare-speed-cli
 ```
 
+### MacPorts
+
+Supports both Intel and Apple Silicon Macs. The package is available on the [official MacPorts repository](https://ports.macports.org/port/cloudflare-speed-cli/) and can be installed with:
+
+```bash
+sudo port install cloudflare-speed-cli
+```
+
 ### Installation Script
 
 For the lazy:
