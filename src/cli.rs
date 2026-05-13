@@ -58,7 +58,7 @@ pub struct Cli {
     pub probe_interval_ms: u64,
 
     /// Probe timeout in milliseconds
-    #[arg(long, default_value_t = 800)]
+    #[arg(long, default_value_t = 2000)]
     pub probe_timeout_ms: u64,
 
     /// Reserved for future experimental features

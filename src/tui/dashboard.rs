@@ -229,7 +229,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         .split(main[1]);
 
     // Idle latency
-    if state.idle_latency_samples.len() >= 2 {
+    if !state.idle_latency_samples.is_empty() {
         // Use the same median calculation as the metrics below
         let median = crate::metrics::compute_metrics(&state.idle_latency_samples)
             .map(|(_, med, _, _)| med)
@@ -252,7 +252,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     }
 
     // Download latency
-    if state.loaded_dl_latency_samples.len() >= 2 {
+    if !state.loaded_dl_latency_samples.is_empty() {
         // Use the same median calculation as the metrics below
         let median = crate::metrics::compute_metrics(&state.loaded_dl_latency_samples)
             .map(|(_, med, _, _)| med)
@@ -285,7 +285,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     }
 
     // Upload latency
-    if state.loaded_ul_latency_samples.len() >= 2 {
+    if !state.loaded_ul_latency_samples.is_empty() {
         // Use the same median calculation as the metrics below
         let median = crate::metrics::compute_metrics(&state.loaded_ul_latency_samples)
             .map(|(_, med, _, _)| med)
