@@ -24,11 +24,11 @@ A CLI tool that displays network speed test results from Cloudflare's speed test
 - **IPv4 vs IPv6**: Optional side-by-side comparison (`--compare-ip-versions`)
 - **Traceroute**: Optional ICMP traceroute to the Cloudflare edge (`--traceroute`)
 - **Proxy Support**: Route through HTTP, HTTPS, or SOCKS5 proxies (`--proxy`)
-- **TLS Trust**: Loads OS truststore; supply a private CA with `--certificate`
+- **TLS Trust**: Loads OS truststore, or supply a private CA with `--certificate`
 - **Interface Binding**: Bind to a specific network interface or source IP
 - **Interactive TUI**: Real-time charts and statistics
 - **History**: View and manage past test results
-- **Export**: Save results as JSON or CSV; headless text/JSON modes for scripting
+- **Export**: Save results as JSON or CSV. headless text/JSON modes for scripting
 
 run with `--help` to see full list of features
 

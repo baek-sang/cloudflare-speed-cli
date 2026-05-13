@@ -4,11 +4,79 @@ use ratatui::{
     style::Color,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
 use super::state::UiState;
+
+const NETWORK_COL_WIDTH: usize = 18;
+const MIN_COMMENT_COL_WIDTH: usize = 8;
+
+/// Flattens whitespace (newlines, tabs, multiple spaces) to single spaces and
+/// truncates to `max_chars`, appending `…` if truncated. Returns at most `max_chars`
+/// chars wide. If `max_chars == 0`, returns empty string.
+fn truncate_for_cell(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    // Flatten whitespace
+    let flat: String = s
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let total = flat.chars().count();
+    if total <= max_chars {
+        flat
+    } else if max_chars == 1 {
+        "\u{2026}".to_string()
+    } else {
+        let take = max_chars.saturating_sub(1);
+        let truncated: String = flat.chars().take(take).collect();
+        format!("{}\u{2026}", truncated)
+    }
+}
+
+const MENU_WIDTH: u16 = 32;
+const MENU_BORDER_OVERHEAD: u16 = 2;
+const MENU_FOOTER_LINES: u16 = 2;
+
+pub const MENU_ITEM_VIEW: usize = 0;
+pub const MENU_ITEM_EDIT_COMMENT: usize = 1;
+pub const MENU_ITEM_EXPORT_JSON: usize = 2;
+pub const MENU_ITEM_EXPORT_CSV: usize = 3;
+pub const MENU_ITEM_DELETE: usize = 4;
+pub const MENU_ITEM_COUNT: usize = 5;
+
+const MENU_FOOTER_LINE_1: &str = "\u{2191}\u{2193}: nav  Enter: select";
+const MENU_FOOTER_LINE_2: &str = "Esc: close";
+
+/// Returns the labels for the actions menu, derived from current state.
+/// The label for the comment item is "Add comment" or "Edit comment"
+/// depending on whether the selected run already has a comment.
+pub fn menu_labels(state: &UiState) -> [&'static str; MENU_ITEM_COUNT] {
+    let has_comment = state
+        .history
+        .get(state.history_selected)
+        .and_then(|r| r.comments.as_deref())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let comment_label = if has_comment {
+        "Edit comment"
+    } else {
+        "Add comment"
+    };
+    [
+        "View detail",
+        comment_label,
+        "Export as JSON",
+        "Export as CSV",
+        "Delete",
+    ]
+}
 
 pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
     let mut lines: Vec<Line> = Vec::new();
@@ -62,21 +130,17 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
     header_spans.extend(vec![
         Span::raw(") - "),
         Span::styled("Enter", Style::default().fg(Color::Magenta)),
-        Span::raw(": view, "),
+        Span::raw(": detail, "),
+        Span::styled("Space", Style::default().fg(Color::Magenta)),
+        Span::raw(": actions, "),
         Span::styled("/", Style::default().fg(Color::Magenta)),
         Span::raw(": filter, "),
-        Span::styled("↑↓", Style::default().fg(Color::Magenta)),
-        Span::raw("/"),
-        Span::styled("PgUp/Dn", Style::default().fg(Color::Magenta)),
-        Span::raw(": nav, "),
         Span::styled("r", Style::default().fg(Color::Magenta)),
         Span::raw(": refresh, "),
-        Span::styled("d", Style::default().fg(Color::Magenta)),
-        Span::raw(": del, "),
-        Span::styled("e", Style::default().fg(Color::Magenta)),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::Magenta)),
         Span::raw("/"),
-        Span::styled("c", Style::default().fg(Color::Magenta)),
-        Span::raw(": export"),
+        Span::styled("PgUp/Dn", Style::default().fg(Color::Magenta)),
+        Span::raw(": nav"),
     ]);
     lines.push(Line::from(header_spans));
 
@@ -171,6 +235,12 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
     }
 
     // Add column headers (left-aligned, matching data column widths exactly)
+    // Column widths: # 5, Timestamp 28, DL 10, UL 10, Ping 10, Loss 9, Interface 13, Network 18, Comment fills remainder
+    let fixed_col_width: u16 = 5 + 28 + 10 + 10 + 10 + 9 + 13 + NETWORK_COL_WIDTH as u16;
+    let comment_col_width = area
+        .width
+        .saturating_sub(fixed_col_width + 2 /* borders */)
+        .max(MIN_COMMENT_COL_WIDTH as u16) as usize;
     lines.push(Line::from(vec![
         Span::styled("#    ", Style::default().fg(Color::Gray)), // 5 chars
         Span::styled(
@@ -182,7 +252,11 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
         Span::styled("Ping      ", Style::default().fg(Color::Gray)), // 10 chars
         Span::styled("Loss     ", Style::default().fg(Color::Yellow)), // 9 chars
         Span::styled("Interface    ", Style::default().fg(Color::Blue)), // 13 chars
-        Span::styled("Network", Style::default().fg(Color::Magenta)),
+        Span::styled(
+            format!("{:<width$}", "Network", width = NETWORK_COL_WIDTH),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled("Comment", Style::default().fg(Color::Gray)),
     ]));
 
     // Clamp selection to filtered history bounds
@@ -377,11 +451,23 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
                 },
             ),
             Span::styled(
-                network.to_string(),
+                format!(
+                    "{:<width$}",
+                    truncate_for_cell(network, NETWORK_COL_WIDTH),
+                    width = NETWORK_COL_WIDTH
+                ),
                 if is_selected {
                     style
                 } else {
                     Style::default().fg(Color::Magenta)
+                },
+            ),
+            Span::styled(
+                truncate_for_cell(r.comments.as_deref().unwrap_or(""), comment_col_width),
+                if is_selected {
+                    style
+                } else {
+                    Style::default().fg(Color::Gray)
                 },
             ),
         ]));
@@ -396,101 +482,6 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
                 Style::default().fg(Color::Yellow),
             ),
             Span::styled(&state.history_filter, Style::default().fg(Color::White)),
-        ]));
-    }
-
-    // Show exported path if available
-    if let Some(ref path) = state.last_exported_path {
-        lines.push(Line::from(""));
-
-        // Wrap long paths to fit within the available width
-        // Account for borders (2 chars on each side)
-        let available_width = area.width.saturating_sub(4); // borders
-        let prefix = "Last exported: ";
-        let prefix_len = prefix.chars().count() as u16;
-        let max_path_width = available_width.saturating_sub(prefix_len);
-
-        // Split path into chunks that fit
-        let path_str = path.as_str();
-        let mut remaining = path_str;
-        let mut is_first_line = true;
-
-        while !remaining.is_empty() {
-            let line_width = if is_first_line {
-                // First line can use less width since we have the prefix
-                max_path_width.max(1)
-            } else {
-                // Subsequent lines can use full width (with 2 char indent)
-                available_width.saturating_sub(2).max(1)
-            };
-
-            let remaining_chars = remaining.chars().count() as u16;
-            if remaining_chars <= line_width {
-                // Entire remaining path fits
-                if is_first_line {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Gray)),
-                        Span::styled(remaining, Style::default().fg(Color::Cyan)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(remaining, Style::default().fg(Color::Cyan)),
-                    ]));
-                }
-                break;
-            } else {
-                // Need to split - find a good break point
-                let mut char_count = 0;
-                let mut last_sep_pos = None;
-                let mut break_pos = 0;
-
-                for (idx, ch) in remaining.char_indices() {
-                    if char_count >= line_width {
-                        break;
-                    }
-                    if ch == '/' || ch == '\\' {
-                        last_sep_pos = Some(idx);
-                    }
-                    break_pos = idx + ch.len_utf8();
-                    char_count += 1;
-                }
-
-                // Prefer breaking at path separator, otherwise break at line width
-                let split_pos = if let Some(sep_pos) = last_sep_pos {
-                    if sep_pos > 0 {
-                        sep_pos + 1 // Include the separator
-                    } else {
-                        break_pos
-                    }
-                } else {
-                    break_pos
-                };
-
-                let (chunk, rest) = remaining.split_at(split_pos);
-                if is_first_line {
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Gray)),
-                        Span::styled(chunk, Style::default().fg(Color::Cyan)),
-                    ]));
-                } else {
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(chunk, Style::default().fg(Color::Cyan)),
-                    ]));
-                }
-                remaining = rest;
-                is_first_line = false;
-            }
-        }
-
-        lines.push(Line::from(vec![
-            Span::styled("Press ", Style::default().fg(Color::Gray)),
-            Span::styled("y", Style::default().fg(Color::Magenta)),
-            Span::styled(
-                " to copy path to clipboard",
-                Style::default().fg(Color::Gray),
-            ),
         ]));
     }
 
@@ -515,9 +506,9 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
 }
 
 pub fn draw_history_detail(area: Rect, f: &mut Frame, state: &mut UiState) {
-    let mut lines: Vec<Line> = Vec::new();
+    // Header with run identity and navigation help
+    let mut header_lines: Vec<Line> = Vec::new();
 
-    // Get the filtered history to find the correct selected item
     let filter_lower = state.history_filter.to_lowercase();
     let filtered_history: Vec<&RunResult> = if state.history_filter.is_empty() {
         state.history.iter().collect()
@@ -539,122 +530,311 @@ pub fn draw_history_detail(area: Rect, f: &mut Frame, state: &mut UiState) {
             })
             .collect()
     };
-
     let effective_selected = state
         .history_selected
         .min(filtered_history.len().saturating_sub(1));
 
-    let mut detail_scroll_info: Option<(usize, usize, usize)> = None;
+    header_lines.push(Line::from(vec![
+        Span::styled("JSON Detail", Style::default().fg(Color::Cyan)),
+        Span::raw(" - "),
+        Span::styled("Esc/q", Style::default().fg(Color::Magenta)),
+        Span::raw(": back, "),
+        Span::styled("/", Style::default().fg(Color::Magenta)),
+        Span::raw(": search (regex), "),
+        Span::styled("n", Style::default().fg(Color::Magenta)),
+        Span::raw("/"),
+        Span::styled("N", Style::default().fg(Color::Magenta)),
+        Span::raw(": next/prev, "),
+        Span::styled("\u{2191}\u{2193}/jk/PgUp/PgDn", Style::default().fg(Color::Magenta)),
+        Span::raw(": scroll"),
+    ]));
 
     if let Some(result) = filtered_history.get(effective_selected) {
-        // Header with navigation help
-        lines.push(Line::from(vec![
-            Span::styled("JSON Detail View", Style::default().fg(Color::Cyan)),
-            Span::raw(" - "),
-            Span::styled("Esc/Enter/q", Style::default().fg(Color::Magenta)),
-            Span::raw(": back, "),
-            Span::styled("↑↓/jk", Style::default().fg(Color::Magenta)),
-            Span::raw(": scroll, "),
-            Span::styled("PgUp/PgDn", Style::default().fg(Color::Magenta)),
-            Span::raw(": fast scroll"),
-        ]));
-        lines.push(Line::from(""));
-
-        // Serialize the result to pretty JSON
-        let json_str = serde_json::to_string_pretty(result).unwrap_or_else(|e| format!("Error serializing JSON: {}", e));
-
-        // Split JSON into lines for display
-        let json_lines: Vec<&str> = json_str.lines().collect();
-        let total_lines = json_lines.len();
-
-        // Calculate available height for JSON content
-        // Subtract: 2 borders + 4 header lines (title, blank, network/timestamp, blank)
-        let available_height = (area.height as usize).saturating_sub(6);
-
-        // Clamp scroll offset and write back to state so it can't drift
-        let max_scroll = total_lines.saturating_sub(available_height);
-        state.history_detail_scroll = state.history_detail_scroll.min(max_scroll);
-        let scroll_offset = state.history_detail_scroll;
-
-        // Show scroll position
-        let scroll_info = if total_lines > available_height {
-            format!(
-                " (lines {}-{} of {})",
-                scroll_offset + 1,
-                (scroll_offset + available_height).min(total_lines),
-                total_lines
-            )
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(vec![
+        header_lines.push(Line::from(vec![
             Span::styled(
                 result.network_name.as_deref().unwrap_or("Unknown Network"),
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw(" - "),
             Span::styled(&result.timestamp_utc, Style::default().fg(Color::Gray)),
-            Span::styled(scroll_info, Style::default().fg(Color::Gray)),
         ]));
-        lines.push(Line::from(""));
+    }
 
-        // Add JSON lines with syntax highlighting
-        for line in json_lines.iter().skip(scroll_offset).take(available_height) {
-            // Simple syntax highlighting
-            let styled_line = if line.trim().starts_with('"') && line.contains(':') {
-                // Key-value line
-                if let Some(colon_pos) = line.find(':') {
-                    let (key_part, value_part) = line.split_at(colon_pos + 1);
-                    Line::from(vec![
-                        Span::styled(key_part.to_string(), Style::default().fg(Color::Cyan)),
-                        Span::styled(value_part.to_string(), Style::default().fg(Color::White)),
-                    ])
-                } else {
-                    Line::from(Span::raw(line.to_string()))
-                }
-            } else if line.trim().starts_with('}')
-                || line.trim().starts_with(']')
-                || line.trim().starts_with('{')
-                || line.trim().starts_with('[')
-            {
-                // Brackets
-                Line::from(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::Gray),
-                ))
-            } else {
-                Line::from(Span::raw(line.to_string()))
-            };
-            lines.push(styled_line);
+    // Search status line: shows current pattern (or input cursor while editing)
+    if state.history_detail_search_editing {
+        let mut spans = vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&state.history_detail_search, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Yellow)),
+            Span::styled("  (Enter to confirm, Esc to cancel)", Style::default().fg(Color::Gray)),
+        ];
+        if let Some(ref err) = state.history_detail_search_error {
+            spans.push(Span::styled(
+                format!("  [regex error: {}]", err),
+                Style::default().fg(Color::Red),
+            ));
         }
-        detail_scroll_info = Some((total_lines, available_height, scroll_offset));
+        header_lines.push(Line::from(spans));
+    } else if !state.history_detail_search.is_empty() {
+        header_lines.push(Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&state.history_detail_search, Style::default().fg(Color::Yellow)),
+            Span::styled("  (Esc to clear)", Style::default().fg(Color::Gray)),
+        ]));
+    }
+
+    let header_height = header_lines.len() as u16;
+
+    // Outer block
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title("History - JSON Detail");
+    let inner_area = outer.inner(area);
+    f.render_widget(outer, area);
+
+    // Render header at the top of the inner area
+    let header_area = Rect {
+        x: inner_area.x,
+        y: inner_area.y,
+        width: inner_area.width,
+        height: header_height.min(inner_area.height),
+    };
+    let header_paragraph = Paragraph::new(header_lines);
+    f.render_widget(header_paragraph, header_area);
+
+    // Render the textarea below the header
+    let body_area = Rect {
+        x: inner_area.x,
+        y: inner_area.y + header_area.height,
+        width: inner_area.width,
+        height: inner_area.height.saturating_sub(header_area.height),
+    };
+    if body_area.height > 0 {
+        f.render_widget(&state.history_detail_textarea, body_area);
+    }
+}
+
+pub fn draw_history_menu(area: Rect, f: &mut Frame, state: &UiState) {
+    let labels = menu_labels(state);
+    let item_count = labels.len() as u16;
+    let inner_height = item_count + 1 /* spacer */ + MENU_FOOTER_LINES;
+    let modal_height = inner_height + MENU_BORDER_OVERHEAD;
+    let modal_width = MENU_WIDTH;
+
+    // Clamp if the available area is smaller than the modal.
+    let modal_width = modal_width.min(area.width);
+    let modal_height = modal_height.min(area.height);
+
+    let x = area.x + area.width.saturating_sub(modal_width) / 2;
+    let y = area.y + area.height.saturating_sub(modal_height) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(labels.len() + 3);
+
+    for (idx, label) in labels.iter().enumerate() {
+        let is_selected = state.history_menu_selected == idx;
+
+        let marker = if is_selected { "> " } else { "  " };
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(ratatui::style::Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}{}", marker, label),
+            style,
+        )]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![Span::styled(
+        format!("  {}", MENU_FOOTER_LINE_1),
+        Style::default().fg(Color::Gray),
+    )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("  {}", MENU_FOOTER_LINE_2),
+        Style::default().fg(Color::Gray),
+    )]));
+
+    f.render_widget(Clear, modal_area);
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Actions"));
+    f.render_widget(p, modal_area);
+}
+
+const COMMENT_MODAL_MIN_WIDTH: u16 = 40;
+const COMMENT_MODAL_MAX_WIDTH: u16 = 78;
+const COMMENT_MODAL_BORDER_OVERHEAD: u16 = 2;
+const COMMENT_MODAL_HINT: &str = "Enter: save  Esc: cancel";
+const COMMENT_MODAL_EDITOR_HEIGHT: u16 = 1;
+
+pub fn draw_history_comment_modal(area: Rect, f: &mut Frame, state: &UiState) {
+    let modal_width = COMMENT_MODAL_MAX_WIDTH
+        .min(area.width)
+        .max(COMMENT_MODAL_MIN_WIDTH.min(area.width));
+
+    let footer_lines: u16 = 1;
+    let inner_height = COMMENT_MODAL_EDITOR_HEIGHT + footer_lines;
+    let modal_height = (inner_height + COMMENT_MODAL_BORDER_OVERHEAD).min(area.height);
+
+    let x = area.x + area.width.saturating_sub(modal_width) / 2;
+    let y = area.y + area.height.saturating_sub(modal_height) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    f.render_widget(Clear, modal_area);
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title("Edit Comment");
+    let inner_area = outer.inner(modal_area);
+    f.render_widget(outer, modal_area);
+
+    // Split inner area: editor on top, footer hint at bottom.
+    let editor_height = inner_area
+        .height
+        .saturating_sub(footer_lines)
+        .min(COMMENT_MODAL_EDITOR_HEIGHT);
+    let editor_area = Rect {
+        x: inner_area.x,
+        y: inner_area.y,
+        width: inner_area.width,
+        height: editor_height,
+    };
+    let footer_area = Rect {
+        x: inner_area.x,
+        y: inner_area.y + editor_height,
+        width: inner_area.width,
+        height: inner_area.height.saturating_sub(editor_height),
+    };
+
+    f.render_widget(&state.history_comment_modal_textarea, editor_area);
+
+    let hint = Paragraph::new(Line::from(vec![Span::styled(
+        COMMENT_MODAL_HINT,
+        Style::default().fg(Color::Gray),
+    )]));
+    f.render_widget(hint, footer_area);
+}
+
+const EXPORT_MODAL_MIN_WIDTH: u16 = 32;
+const EXPORT_MODAL_MAX_WIDTH: u16 = 78;
+const EXPORT_MODAL_HEADER_LINES: u16 = 2; // title + blank
+const EXPORT_MODAL_FOOTER_LINES: u16 = 2; // blank + hint
+const EXPORT_MODAL_BORDER_OVERHEAD: u16 = 2;
+const EXPORT_MODAL_HINT_COPY: &str = "c: copy path  Esc/Enter: close";
+const EXPORT_MODAL_HINT_COPIED: &str = "\u{2713} Copied  Esc/Enter: close";
+
+/// Wraps a filesystem path into lines that each fit within `width` characters,
+/// preferring to break at path separators when possible.
+fn wrap_path(path: &str, width: u16) -> Vec<String> {
+    let mut out = Vec::new();
+    let width = width.max(1) as usize;
+    let mut remaining = path;
+
+    while !remaining.is_empty() {
+        let remaining_chars = remaining.chars().count();
+        if remaining_chars <= width {
+            out.push(remaining.to_string());
+            break;
+        }
+
+        let mut char_count = 0;
+        let mut last_sep_pos = None;
+        let mut break_pos = 0;
+        for (idx, ch) in remaining.char_indices() {
+            if char_count >= width {
+                break;
+            }
+            if ch == '/' || ch == '\\' {
+                last_sep_pos = Some(idx);
+            }
+            break_pos = idx + ch.len_utf8();
+            char_count += 1;
+        }
+
+        let split_pos = match last_sep_pos {
+            Some(sep_pos) if sep_pos > 0 => sep_pos + 1, // include separator
+            _ => break_pos,
+        };
+
+        let (chunk, rest) = remaining.split_at(split_pos);
+        out.push(chunk.to_string());
+        remaining = rest;
+    }
+
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+pub fn draw_history_export_modal(area: Rect, f: &mut Frame, state: &UiState) {
+    let Some(ref path) = state.history_export_modal_path else {
+        return;
+    };
+
+    let modal_width = EXPORT_MODAL_MAX_WIDTH
+        .min(area.width)
+        .max(EXPORT_MODAL_MIN_WIDTH.min(area.width));
+    let inner_width = modal_width.saturating_sub(EXPORT_MODAL_BORDER_OVERHEAD + 2); // -2 for left/right padding
+    let path_lines = wrap_path(path, inner_width);
+
+    let path_line_count = path_lines.len() as u16;
+    let inner_height =
+        EXPORT_MODAL_HEADER_LINES + path_line_count + EXPORT_MODAL_FOOTER_LINES;
+    let modal_height = (inner_height + EXPORT_MODAL_BORDER_OVERHEAD).min(area.height);
+
+    let x = area.x + area.width.saturating_sub(modal_width) / 2;
+    let y = area.y + area.height.saturating_sub(modal_height) / 2;
+    let modal_area = Rect {
+        x,
+        y,
+        width: modal_width,
+        height: modal_height,
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(path_lines.len() + 4);
+    lines.push(Line::from(vec![Span::styled(
+        " Exported to:",
+        Style::default().fg(Color::Gray),
+    )]));
+    lines.push(Line::from(""));
+    for chunk in path_lines {
+        lines.push(Line::from(vec![Span::styled(
+            format!(" {}", chunk),
+            Style::default().fg(Color::Cyan),
+        )]));
+    }
+    lines.push(Line::from(""));
+    let hint = if state.history_export_modal_copied {
+        EXPORT_MODAL_HINT_COPIED
     } else {
-        lines.push(Line::from("No item selected."));
-    }
+        EXPORT_MODAL_HINT_COPY
+    };
+    let hint_color = if state.history_export_modal_copied {
+        Color::Green
+    } else {
+        Color::Gray
+    };
+    lines.push(Line::from(vec![Span::styled(
+        format!(" {}", hint),
+        Style::default().fg(hint_color),
+    )]));
 
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("History - JSON Detail"),
-    );
-    f.render_widget(p, area);
-
-    // Render scrollbar after paragraph so it draws on top
-    if let Some((total_lines, available_height, scroll_offset)) = detail_scroll_info {
-        if total_lines > available_height {
-            let max_scroll = total_lines.saturating_sub(available_height);
-            let mut scrollbar_state = ScrollbarState::new(max_scroll)
-                .position(scroll_offset);
-            f.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("↑"))
-                    .end_symbol(Some("↓")),
-                area.inner(Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut scrollbar_state,
-            );
-        }
-    }
+    f.render_widget(Clear, modal_area);
+    let p = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Export"));
+    f.render_widget(p, modal_area);
 }

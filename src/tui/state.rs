@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
 };
 use std::time::Instant;
+use ratatui_textarea::TextArea;
 
 pub struct UiState {
     pub tab: usize,
@@ -65,14 +66,26 @@ pub struct UiState {
     pub charts_available_networks: Vec<String>, // List of unique network names from history
     // History detail view state
     pub history_detail_view: bool,    // Whether showing JSON detail view
-    pub history_detail_scroll: usize, // Scroll position in detail view
+    pub history_detail_textarea: TextArea<'static>,
+    pub history_detail_search: String,        // Current regex pattern
+    pub history_detail_search_editing: bool,  // In search input mode
+    pub history_detail_search_error: Option<String>, // Last regex compile error, if any
+    // History context menu state
+    pub history_menu_open: bool,        // Whether the Space-triggered action menu is visible
+    pub history_menu_selected: usize,   // Index of the highlighted menu item
     pub ip: Option<String>,
     pub colo: Option<String>,
     pub server: Option<String>,
     pub asn: Option<String>,
     pub as_org: Option<String>,
     pub auto_save: bool,
-    pub last_exported_path: Option<String>,
+    // Post-export result modal
+    pub history_export_modal_open: bool,
+    pub history_export_modal_path: Option<String>,
+    pub history_export_modal_copied: bool,
+    // Comment editor modal
+    pub history_comment_modal_open: bool,
+    pub history_comment_modal_textarea: TextArea<'static>,
     // Network interface information
     pub interface_name: Option<String>,
     pub network_name: Option<String>,
@@ -147,14 +160,23 @@ impl Default for UiState {
             charts_network_filter: None,
             charts_available_networks: Vec::new(),
             history_detail_view: false,
-            history_detail_scroll: 0,
+            history_detail_textarea: TextArea::default(),
+            history_detail_search: String::new(),
+            history_detail_search_editing: false,
+            history_detail_search_error: None,
+            history_menu_open: false,
+            history_menu_selected: 0,
             ip: None,
             colo: None,
             server: None,
             asn: None,
             as_org: None,
             auto_save: true,
-            last_exported_path: None,
+            history_export_modal_open: false,
+            history_export_modal_path: None,
+            history_export_modal_copied: false,
+            history_comment_modal_open: false,
+            history_comment_modal_textarea: TextArea::default(),
             interface_name: None,
             network_name: None,
             is_wireless: None,
