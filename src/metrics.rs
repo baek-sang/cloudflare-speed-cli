@@ -1,7 +1,7 @@
 /// Compute metrics (mean, median, 25th percentile, 75th percentile) from samples.
 /// Takes a slice to avoid unnecessary allocations; sorts a temporary copy internally.
 pub fn compute_metrics(samples: &[f64]) -> Option<(f64, f64, f64, f64)> {
-    if samples.len() < 2 {
+    if samples.is_empty() {
         return None;
     }
     let n = samples.len();
@@ -43,9 +43,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_metrics_insufficient_samples() {
-        assert!(compute_metrics(&[1.0]).is_none());
+    fn test_compute_metrics_empty() {
         assert!(compute_metrics(&[]).is_none());
+    }
+
+    #[test]
+    fn test_compute_metrics_single_sample() {
+        let (mean, median, p25, p75) = compute_metrics(&[42.0]).unwrap();
+        assert!((mean - 42.0).abs() < 0.001);
+        assert!((median - 42.0).abs() < 0.001);
+        assert!((p25 - 42.0).abs() < 0.001);
+        assert!((p75 - 42.0).abs() < 0.001);
     }
 
     #[test]
