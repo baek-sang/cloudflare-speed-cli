@@ -185,22 +185,27 @@ fn csv_escape(s: &str) -> String {
 pub fn load_recent(limit: usize) -> Result<Vec<RunResult>> {
     ensure_dirs()?;
     let dir = runs_dir();
-    let mut entries: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    // Sort by filename: run files are named `run-{timestamp}-{meas_id}.json` where the
+    // timestamp is the run's own ISO timestamp. Lex order on filename matches run order,
+    // and is stable against file rewrites (e.g. editing a comment) which would otherwise
+    // push an old run to the top if we sorted by mtime.
+    let mut entries: Vec<PathBuf> = Vec::new();
     for e in std::fs::read_dir(&dir).context("read runs dir")? {
         let e = e?;
         let p = e.path();
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let m = e.metadata()?;
-        let mt = m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        entries.push((mt, p));
+        entries.push(p);
     }
-    entries.sort_by_key(|(t, _)| *t);
-    entries.reverse();
+    entries.sort_by(|a, b| {
+        let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        bn.cmp(an) // descending: newest first
+    });
 
     let mut out = Vec::new();
-    for (_, p) in entries.into_iter().take(limit) {
+    for p in entries.into_iter().take(limit) {
         let data = std::fs::read(&p).with_context(|| format!("read {}", p.display()))?;
         let r: RunResult =
             serde_json::from_slice(&data).with_context(|| format!("parse {}", p.display()))?;
