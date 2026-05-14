@@ -3,6 +3,7 @@ mod dashboard;
 mod export;
 mod help;
 mod history;
+mod log_style;
 mod state;
 mod traceroute;
 

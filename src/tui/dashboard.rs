@@ -12,6 +12,7 @@ use ratatui::{
 };
 
 use super::charts;
+use super::log_style;
 use super::state::{push_wrapped_status_kv, UiState};
 
 /// Helper function to get the maximum y value from a series of points
@@ -522,20 +523,29 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         .map(|ip| if ip.contains(':') { "IPv6" } else { "IPv4" })
         .unwrap_or("-");
 
+    let ip_version_color = match ip_version {
+        "IPv4" => Color::Green,
+        "IPv6" => Color::Cyan,
+        _ => Color::Gray,
+    };
+
+    let is_wireless = state.is_wireless.unwrap_or(false);
+    let (link_label, link_color) = if is_wireless {
+        ("Wireless", Color::Yellow)
+    } else {
+        ("Wired", Color::Green)
+    };
+
     let mut network_lines = vec![
         Line::from(vec![
             Span::styled("Connected via: ", Style::default().fg(Color::Gray)),
-            Span::raw(ip_version),
+            Span::styled(ip_version, Style::default().fg(ip_version_color)),
         ]),
         Line::from(vec![
             Span::styled("Interface: ", Style::default().fg(Color::Gray)),
             Span::raw(state.interface_name.as_deref().unwrap_or("-")),
             Span::raw(" ("),
-            Span::raw(if state.is_wireless.unwrap_or(false) {
-                "Wireless"
-            } else {
-                "Wired"
-            }),
+            Span::styled(link_label, Style::default().fg(link_color)),
             Span::raw(")"),
         ]),
         Line::from(vec![
@@ -550,7 +560,10 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         ]),
         Line::from(vec![
             Span::styled("MAC address: ", Style::default().fg(Color::Gray)),
-            Span::raw(state.interface_mac.as_deref().unwrap_or("-")),
+            Span::styled(
+                state.interface_mac.as_deref().unwrap_or("-").to_string(),
+                Style::default().fg(Color::Magenta),
+            ),
         ]),
     ];
 
@@ -558,7 +571,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     if let Some(ref cert_filename) = state.certificate_filename {
         network_lines.push(Line::from(vec![
             Span::styled("Certificate: ", Style::default().fg(Color::Gray)),
-            Span::raw(cert_filename),
+            Span::styled(cert_filename.clone(), Style::default().fg(Color::Cyan)),
         ]));
     }
 
@@ -566,36 +579,64 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     if let Some(ref proxy_url) = state.proxy_url {
         network_lines.push(Line::from(vec![
             Span::styled("Proxy: ", Style::default().fg(Color::Gray)),
-            Span::styled(proxy_url, Style::default().fg(Color::Yellow)),
+            Span::styled(proxy_url.clone(), Style::default().fg(Color::Yellow)),
         ]));
     }
 
+    network_lines.push(Line::from(vec![
+        Span::styled("Server location: ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            state.server.as_deref().unwrap_or("-").to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+    ]));
+
+    // "Your network: ORG (ASNXXXX)" — split so we can dim the AS number.
+    let mut your_network: Vec<Span<'static>> = vec![Span::styled(
+        "Your network: ",
+        Style::default().fg(Color::Gray),
+    )];
+    match (state.as_org.as_deref(), state.asn.as_deref()) {
+        (Some(org), Some(asn)) => {
+            your_network.push(Span::styled(org.to_string(), Style::default().fg(Color::Cyan)));
+            your_network.push(Span::raw(" ("));
+            your_network.push(Span::styled(
+                format!("AS{}", asn),
+                Style::default().fg(Color::Magenta),
+            ));
+            your_network.push(Span::raw(")"));
+        }
+        (Some(org), None) => {
+            your_network.push(Span::styled(org.to_string(), Style::default().fg(Color::Cyan)));
+        }
+        (None, Some(asn)) => {
+            your_network.push(Span::styled(
+                format!("AS{}", asn),
+                Style::default().fg(Color::Magenta),
+            ));
+        }
+        (None, None) => your_network.push(Span::raw("-")),
+    }
+    network_lines.push(Line::from(your_network));
+
     network_lines.extend(vec![
         Line::from(vec![
-            Span::styled("Server location: ", Style::default().fg(Color::Gray)),
-            Span::raw(state.server.as_deref().unwrap_or("-")),
-        ]),
-        Line::from(vec![
-            Span::styled("Your network: ", Style::default().fg(Color::Gray)),
-            Span::raw(match (state.as_org.as_deref(), state.asn.as_deref()) {
-                (Some(org), Some(asn)) => format!("{} (AS{})", org, asn),
-                (Some(org), None) => org.to_string(),
-                (None, Some(asn)) => format!("AS{}", asn),
-                (None, None) => "-".to_string(),
-            }),
-        ]),
-        Line::from(vec![
             Span::styled("External IPv4: ", Style::default().fg(Color::Gray)),
-            Span::raw(
+            Span::styled(
                 state
                     .external_ipv4
                     .as_deref()
-                    .unwrap_or(state.ip.as_deref().unwrap_or("-")),
+                    .unwrap_or(state.ip.as_deref().unwrap_or("-"))
+                    .to_string(),
+                Style::default().fg(Color::Green),
             ),
         ]),
         Line::from(vec![
             Span::styled("External IPv6: ", Style::default().fg(Color::Gray)),
-            Span::raw(state.external_ipv6.as_deref().unwrap_or("-")),
+            Span::styled(
+                state.external_ipv6.as_deref().unwrap_or("-").to_string(),
+                Style::default().fg(Color::Cyan),
+            ),
         ]),
     ]);
 
@@ -611,55 +652,70 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         if let Some(ref dns) = state.dns_summary {
             network_lines.push(Line::from(vec![
                 Span::styled("DNS resolution: ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{:.2}ms", dns.resolution_time_ms)),
+                Span::styled(
+                    format!("{:.2}ms", dns.resolution_time_ms),
+                    Style::default().fg(Color::Yellow),
+                ),
             ]));
         }
 
         if let Some(ref tls) = state.tls_summary {
             network_lines.push(Line::from(vec![
                 Span::styled("TLS handshake: ", Style::default().fg(Color::Gray)),
-                Span::raw(format!(
-                    "{:.2}ms {}",
-                    tls.handshake_time_ms,
-                    tls.protocol_version.as_deref().unwrap_or("-")
-                )),
+                Span::styled(
+                    format!("{:.2}ms", tls.handshake_time_ms),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    tls.protocol_version.as_deref().unwrap_or("-").to_string(),
+                    Style::default().fg(Color::Green),
+                ),
             ]));
         }
 
         if let Some(ref cmp) = state.ip_comparison {
-            let v4_str = cmp
-                .ipv4_result
-                .as_ref()
-                .map(|r| {
-                    if r.available {
-                        format!("{:.1}Mbps", r.download_mbps)
-                    } else {
-                        "N/A".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "-".to_string());
-            let v6_str = cmp
-                .ipv6_result
-                .as_ref()
-                .map(|r| {
-                    if r.available {
-                        format!("{:.1}Mbps", r.download_mbps)
-                    } else {
-                        "N/A".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "-".to_string());
-            network_lines.push(Line::from(vec![
-                Span::styled("IPv4 vs IPv6: ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("v4:{} v6:{}", v4_str, v6_str)),
-            ]));
+            let mut cmp_spans: Vec<Span<'static>> = vec![Span::styled(
+                "IPv4 vs IPv6: ",
+                Style::default().fg(Color::Gray),
+            )];
+            cmp_spans.push(Span::styled("v4:", Style::default().fg(Color::Gray)));
+            match cmp.ipv4_result.as_ref() {
+                Some(r) if r.available => cmp_spans.push(Span::styled(
+                    format!("{:.1}Mbps", r.download_mbps),
+                    Style::default().fg(Color::Green),
+                )),
+                Some(_) => cmp_spans.push(Span::styled("N/A", Style::default().fg(Color::Red))),
+                None => cmp_spans.push(Span::raw("-")),
+            }
+            cmp_spans.push(Span::raw(" "));
+            cmp_spans.push(Span::styled("v6:", Style::default().fg(Color::Gray)));
+            match cmp.ipv6_result.as_ref() {
+                Some(r) if r.available => cmp_spans.push(Span::styled(
+                    format!("{:.1}Mbps", r.download_mbps),
+                    Style::default().fg(Color::Cyan),
+                )),
+                Some(_) => cmp_spans.push(Span::styled("N/A", Style::default().fg(Color::Red))),
+                None => cmp_spans.push(Span::raw("-")),
+            }
+            network_lines.push(Line::from(cmp_spans));
         }
 
         if let Some(ref tr) = state.traceroute_summary {
-            let status = if tr.completed { "complete" } else { "partial" };
+            let (status, status_color) = if tr.completed {
+                ("complete", Color::Green)
+            } else {
+                ("partial", Color::Yellow)
+            };
             network_lines.push(Line::from(vec![
                 Span::styled("Traceroute: ", Style::default().fg(Color::Gray)),
-                Span::raw(format!("{} hops ({})", tr.hops.len(), status)),
+                Span::styled(
+                    tr.hops.len().to_string(),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(" hops (", Style::default().fg(Color::Gray)),
+                Span::styled(status, Style::default().fg(status_color)),
+                Span::styled(")", Style::default().fg(Color::Gray)),
             ]));
         }
     }
@@ -714,7 +770,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         let start = end.saturating_sub(visible_rows);
         state.text_log[start..end]
             .iter()
-            .map(|s| Line::raw(s.clone()))
+            .map(|s| log_style::style_log_line(s))
             .collect()
     };
 
