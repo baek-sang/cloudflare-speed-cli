@@ -1,12 +1,22 @@
 //! TLS handshake time measurement module
 
 use crate::model::TlsSummary;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rustls::pki_types::ServerName;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::net::TcpStream;
+use std::time::{Duration, Instant};
+use tokio::net::{lookup_host, TcpSocket};
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
+
+/// Per-address TCP connect timeout. Kept short so unreachable addresses
+/// (e.g. blackholed IPv6) fall through to the next candidate quickly instead
+/// of stalling on the kernel's SYN retransmit timer (~75-180s).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Overall TLS handshake timeout, applied separately from TCP connect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Install the ring crypto provider if not already installed.
 fn ensure_crypto_provider() {
@@ -19,10 +29,16 @@ fn ensure_crypto_provider() {
 ///
 /// This measures only the TLS handshake, not including TCP connection time.
 /// Returns a `TlsSummary` with handshake time, protocol version, and cipher suite.
+///
+/// When `bind_ip` is set, candidate addresses are filtered to the bind IP's
+/// family and the TCP socket is bound to that source IP before connect. This
+/// keeps the measurement on the same interface the rest of the test runs on
+/// (e.g. `--interface wg0`).
 pub async fn measure_tls_handshake(
     hostname: &str,
     port: u16,
     cert_path: Option<&std::path::Path>,
+    bind_ip: Option<IpAddr>,
 ) -> Result<TlsSummary> {
     // Ensure the crypto provider is installed
     ensure_crypto_provider();
@@ -51,23 +67,20 @@ pub async fn measure_tls_handshake(
 
     let connector = TlsConnector::from(Arc::new(config));
 
-    // First establish TCP connection (we don't time this)
-    let addr = format!("{}:{}", hostname, port);
-    let tcp_stream = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("TCP connection failed to {}", addr))?;
+    // Resolve and connect, trying each address until one succeeds.
+    let tcp_stream = connect_tcp(hostname, port, bind_ip).await?;
 
     // Parse server name for TLS
     let server_name: ServerName<'static> = hostname
         .to_string()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid DNS name: {}", hostname))?;
+        .map_err(|_| anyhow!("Invalid DNS name: {}", hostname))?;
 
     // Time only the TLS handshake
     let start = Instant::now();
-    let tls_stream = connector
-        .connect(server_name, tcp_stream)
+    let tls_stream = timeout(HANDSHAKE_TIMEOUT, connector.connect(server_name, tcp_stream))
         .await
+        .with_context(|| format!("TLS handshake timed out after {:?}", HANDSHAKE_TIMEOUT))?
         .with_context(|| format!("TLS handshake failed with {}", hostname))?;
     let handshake_time = start.elapsed();
 
@@ -85,6 +98,76 @@ pub async fn measure_tls_handshake(
         protocol_version,
         cipher_suite,
     })
+}
+
+/// Resolve `hostname:port` and connect to the first reachable address whose
+/// family matches `bind_ip` (or any family if `bind_ip` is None). Binds the
+/// socket to `bind_ip` before connecting when set, and applies a per-address
+/// connect timeout so unreachable addresses don't stall the test.
+async fn connect_tcp(
+    hostname: &str,
+    port: u16,
+    bind_ip: Option<IpAddr>,
+) -> Result<tokio::net::TcpStream> {
+    let lookup_target = format!("{}:{}", hostname, port);
+    let resolved: Vec<SocketAddr> = lookup_host(&lookup_target)
+        .await
+        .with_context(|| format!("DNS lookup failed for {}", hostname))?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(anyhow!("DNS returned no addresses for {}", hostname));
+    }
+
+    // Filter by bind family if set; otherwise try all.
+    let candidates: Vec<SocketAddr> = match bind_ip {
+        Some(IpAddr::V4(_)) => resolved.iter().copied().filter(|a| a.is_ipv4()).collect(),
+        Some(IpAddr::V6(_)) => resolved.iter().copied().filter(|a| a.is_ipv6()).collect(),
+        None => resolved.clone(),
+    };
+
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no resolved address for {} matches the bind IP family",
+            hostname
+        ));
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for addr in candidates {
+        let socket = match if addr.is_ipv4() {
+            TcpSocket::new_v4()
+        } else {
+            TcpSocket::new_v6()
+        } {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(anyhow!(e).context("failed to create socket"));
+                continue;
+            }
+        };
+
+        if let Some(ip) = bind_ip {
+            if let Err(e) = socket.bind(SocketAddr::new(ip, 0)) {
+                last_err = Some(anyhow!(e).context(format!("failed to bind to {}", ip)));
+                continue;
+            }
+        }
+
+        match timeout(CONNECT_TIMEOUT, socket.connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last_err = Some(anyhow!(e).context(format!("connect to {} failed", addr))),
+            Err(_) => {
+                last_err = Some(anyhow!(
+                    "connect to {} timed out after {:?}",
+                    addr,
+                    CONNECT_TIMEOUT
+                ))
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("no addresses to try for {}", hostname)))
 }
 
 /// Extract hostname and port from a URL string.

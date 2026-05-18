@@ -1,10 +1,10 @@
 use crate::engine::network_bind;
 use crate::model::{ExperimentalUdpSummary, RunConfig, TestEvent, TurnInfo};
 use crate::stats::{latency_summary_from_samples, OnlineStats};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -140,76 +140,41 @@ pub async fn run_udp_like_loss_probe(
     turn: &TurnInfo,
     cfg: &RunConfig,
     event_tx: &mpsc::Sender<TestEvent>,
-    pre_resolved: Option<SocketAddr>,
+    pre_resolved: Vec<SocketAddr>,
 ) -> Result<ExperimentalUdpSummary> {
     let target_url = pick_stun_target(turn).context("no stun/turn url in /__turn")?;
     let (host, port) = parse_host_port(&target_url)?;
 
-    let addr: SocketAddr = if let Some(a) = pre_resolved {
-        a
+    // Use prefetched addresses when available, otherwise resolve now.
+    let resolved: Vec<SocketAddr> = if pre_resolved.is_empty() {
+        tokio::net::lookup_host((host.as_str(), port))
+            .await?
+            .collect()
     } else {
-        let mut addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
-        addrs.next().context("dns returned no addresses")?
+        pre_resolved
     };
 
-    // Bind UDP socket to interface or source IP if specified
-    let sock = if cfg.interface.is_some() || cfg.source_ip.is_some() {
-        let bind_addr =
-            network_bind::resolve_bind_address(cfg.interface.as_ref(), cfg.source_ip.as_ref())?;
+    if resolved.is_empty() {
+        return Err(anyhow!("dns returned no addresses for {}", host));
+    }
 
-        if let Some(addr) = bind_addr {
-            // Create socket using socket2 for binding
-            let domain = socket2::Domain::for_address(addr);
-            let socket =
-                socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-
-            // Bind to the specified address
-            socket.bind(&socket2::SockAddr::from(addr))?;
-
-            // Bind to interface if specified (Linux only)
-            #[cfg(target_os = "linux")]
-            if let Some(ref iface) = cfg.interface {
-                use std::ffi::CString;
-                use std::os::unix::io::AsRawFd;
-
-                let ifname = CString::new(iface.as_str()).map_err(|_| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
-                })?;
-
-                unsafe {
-                    if libc::setsockopt(
-                        socket.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_BINDTODEVICE,
-                        ifname.as_ptr() as *const libc::c_void,
-                        ifname.as_bytes().len() as libc::socklen_t,
-                    ) != 0
-                    {
-                        return Err(anyhow::anyhow!(
-                            "Failed to bind to interface {}: {}",
-                            iface,
-                            std::io::Error::last_os_error()
-                        ));
-                    }
-                }
-            }
-
-            // Convert to tokio UdpSocket
-            let std_socket: std::net::UdpSocket = socket.into();
-            std_socket.set_nonblocking(true)?;
-            UdpSocket::from_std(std_socket)?
-        } else {
-            // Bind to appropriate address family based on target
-            let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-            UdpSocket::bind(bind_addr).await?
-        }
-    } else {
-        // Bind ephemeral UDP - match target address family
-        let bind_addr = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        UdpSocket::bind(bind_addr).await?
+    // When a bind IP is set, only target addresses of the matching family are
+    // reachable: a UDP socket bound to a v4 source can't connect() to a v6
+    // peer (EAFNOSUPPORT) and vice versa.
+    let candidates: Vec<SocketAddr> = match cfg.resolved_bind_ip {
+        Some(IpAddr::V4(_)) => resolved.iter().copied().filter(|a| a.is_ipv4()).collect(),
+        Some(IpAddr::V6(_)) => resolved.iter().copied().filter(|a| a.is_ipv6()).collect(),
+        None => resolved,
     };
 
-    sock.connect(addr).await?;
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no resolved address for {} matches the bind IP family",
+            host
+        ));
+    }
+
+    let (sock, _addr) = bind_and_connect_udp(&candidates, cfg).await?;
 
     let timeout = Duration::from_millis(600);
     let interval = Duration::from_millis(80);
@@ -315,4 +280,92 @@ pub async fn run_udp_like_loss_probe(
         mos,
         quality_label: label.to_string(),
     })
+}
+
+/// Create a UDP socket honoring `--interface` / `--source`, then `connect()`
+/// to the first candidate the kernel accepts. Returns the connected socket
+/// and the address it ended up connected to. Each candidate must match the
+/// bind IP family - the caller is expected to have already filtered.
+async fn bind_and_connect_udp(
+    candidates: &[SocketAddr],
+    cfg: &RunConfig,
+) -> Result<(UdpSocket, SocketAddr)> {
+    let bind_addr =
+        network_bind::resolve_bind_address(cfg.interface.as_ref(), cfg.source_ip.as_ref())?;
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for &addr in candidates {
+        let sock = match build_udp_socket(addr, bind_addr, cfg.interface.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+
+        match sock.connect(addr).await {
+            Ok(()) => return Ok((sock, addr)),
+            Err(e) => last_err = Some(anyhow!(e).context(format!("connect to {} failed", addr))),
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("no UDP candidates to try")))
+}
+
+/// Build a single UDP socket: bind to source IP if set, fall back to an
+/// ephemeral wildcard bind matching the target family otherwise. On Linux,
+/// also apply `SO_BINDTODEVICE` when an interface name is provided so the
+/// kernel can't reroute the packets out a different NIC.
+fn build_udp_socket(
+    target: SocketAddr,
+    bind_addr: Option<SocketAddr>,
+    interface: Option<&str>,
+) -> Result<UdpSocket> {
+    if let Some(addr) = bind_addr {
+        let domain = socket2::Domain::for_address(addr);
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        socket.bind(&socket2::SockAddr::from(addr))?;
+
+        #[cfg(target_os = "linux")]
+        if let Some(iface) = interface {
+            use std::ffi::CString;
+            use std::os::unix::io::AsRawFd;
+
+            let ifname = CString::new(iface).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
+            })?;
+            unsafe {
+                if libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
+                    ifname.as_ptr() as *const libc::c_void,
+                    ifname.as_bytes().len() as libc::socklen_t,
+                ) != 0
+                {
+                    return Err(anyhow!(
+                        "Failed to bind to interface {}: {}",
+                        iface,
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = interface;
+
+        let std_socket: std::net::UdpSocket = socket.into();
+        std_socket.set_nonblocking(true)?;
+        Ok(UdpSocket::from_std(std_socket)?)
+    } else {
+        let any = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        Ok(std::net::UdpSocket::bind(any)
+            .and_then(|s| {
+                s.set_nonblocking(true)?;
+                Ok(s)
+            })
+            .map(UdpSocket::from_std)??)
+    }
 }

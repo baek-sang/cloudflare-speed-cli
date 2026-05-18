@@ -184,7 +184,14 @@ impl TestEngine {
                     .await
                     .ok();
 
-                match tls::measure_tls_handshake(&hostname, port, self.cfg.certificate_path.as_deref()).await {
+                match tls::measure_tls_handshake(
+                    &hostname,
+                    port,
+                    self.cfg.certificate_path.as_deref(),
+                    self.cfg.resolved_bind_ip,
+                )
+                .await
+                {
                     Ok(summary) => {
                         event_tx
                             .send(TestEvent::DiagnosticTls {
@@ -272,8 +279,14 @@ impl TestEngine {
                     .await
                     .ok();
 
-                match traceroute::run_traceroute(&hostname, self.cfg.traceroute_max_hops, &event_tx)
-                    .await
+                match traceroute::run_traceroute(
+                    &hostname,
+                    self.cfg.traceroute_max_hops,
+                    &event_tx,
+                    self.cfg.resolved_bind_ip,
+                    self.cfg.interface.as_deref(),
+                )
+                .await
                 {
                     Ok(summary) => {
                         event_tx
@@ -339,12 +352,14 @@ impl TestEngine {
             .await
             .ok();
 
-        // Prefetch DNS for STUN server during upload to eliminate delay before packet loss phase
+        // Prefetch DNS for STUN server during upload to eliminate delay before packet loss phase.
+        // Collect *all* resolved addresses so the UDP probe can filter by bind-IP family
+        // (binding to a v4 source IP and connecting to a v6 target fails with EAFNOSUPPORT).
         let stun_dns_handle = tokio::spawn(async move {
             tokio::net::lookup_host(("turn.cloudflare.com", 3478_u16))
                 .await
-                .ok()
-                .and_then(|mut addrs| addrs.next())
+                .map(|addrs| addrs.collect::<Vec<_>>())
+                .unwrap_or_default()
         });
 
         let (upload, loaded_latency_upload) = throughput::run_upload_with_loaded_latency(
@@ -368,8 +383,8 @@ impl TestEngine {
             credential: None,
         };
 
-        // Use prefetched DNS if available
-        let pre_resolved = stun_dns_handle.await.ok().flatten();
+        // Use prefetched DNS if available (empty Vec means resolve inline)
+        let pre_resolved: Vec<std::net::SocketAddr> = stun_dns_handle.await.unwrap_or_default();
 
         match turn_udp::run_udp_like_loss_probe(&info, &self.cfg, &event_tx, pre_resolved).await {
             Ok(udp) => {

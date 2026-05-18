@@ -24,16 +24,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Run traceroute to the destination.
 ///
 /// Tries raw ICMP first, falls back to system traceroute if that fails.
+/// When `bind_ip` is set, the destination is resolved to an address of the
+/// matching family and the probe is sourced from that IP. When `interface`
+/// is set on Linux, `SO_BINDTODEVICE` keeps probes on that NIC.
 pub async fn run_traceroute(
     destination: &str,
     max_hops: u8,
     event_tx: &mpsc::Sender<TestEvent>,
+    bind_ip: Option<IpAddr>,
+    interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
-    // Resolve destination to IP
-    let ip = resolve_destination(destination)?;
+    // Resolve destination to IP, preferring the bind IP's family when set.
+    let ip = resolve_destination(destination, bind_ip)?;
 
     // Try raw ICMP first
-    match run_icmp_traceroute(&ip, max_hops, event_tx).await {
+    match run_icmp_traceroute(&ip, max_hops, event_tx, bind_ip, interface).await {
         Ok(summary) => return Ok(summary),
         Err(e) => {
             // Send info about fallback
@@ -46,24 +51,40 @@ pub async fn run_traceroute(
     }
 
     // Fall back to system traceroute
-    run_system_traceroute(destination, &ip, max_hops, event_tx).await
+    run_system_traceroute(destination, &ip, max_hops, event_tx, bind_ip, interface).await
 }
 
-/// Resolve destination hostname to IP address.
-fn resolve_destination(destination: &str) -> Result<IpAddr> {
+/// Resolve destination hostname to IP address. When `bind_ip` is set, prefer
+/// a resolved address of the same family; if none exists, error rather than
+/// returning an address the bound socket can't reach.
+fn resolve_destination(destination: &str, bind_ip: Option<IpAddr>) -> Result<IpAddr> {
     // Try to parse as IP first
     if let Ok(ip) = destination.parse::<IpAddr>() {
         return Ok(ip);
     }
 
     // Try DNS resolution
-    let addr = format!("{}:0", destination)
+    let addrs: Vec<IpAddr> = format!("{}:0", destination)
         .to_socket_addrs()
         .with_context(|| format!("Failed to resolve {}", destination))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No addresses found for {}", destination))?;
+        .map(|a| a.ip())
+        .collect();
 
-    Ok(addr.ip())
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("No addresses found for {}", destination));
+    }
+
+    match bind_ip {
+        Some(IpAddr::V4(_)) => addrs
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| anyhow::anyhow!("No IPv4 address for {} matches bind IP family", destination)),
+        Some(IpAddr::V6(_)) => addrs
+            .into_iter()
+            .find(|a| a.is_ipv6())
+            .ok_or_else(|| anyhow::anyhow!("No IPv6 address for {} matches bind IP family", destination)),
+        None => Ok(addrs.into_iter().next().unwrap()),
+    }
 }
 
 /// Run traceroute using raw ICMP sockets (requires elevated privileges).
@@ -71,6 +92,8 @@ async fn run_icmp_traceroute(
     destination: &IpAddr,
     max_hops: u8,
     event_tx: &mpsc::Sender<TestEvent>,
+    bind_ip: Option<IpAddr>,
+    interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
     // Check if we're dealing with IPv4 - IPv6 traceroute is more complex
     let dest_v4 = match destination {
@@ -82,9 +105,55 @@ async fn run_icmp_traceroute(
         }
     };
 
+    // Refuse a v6 bind against a v4 destination - the socket would error on
+    // bind() anyway, so fail fast with a clearer message.
+    if let Some(IpAddr::V6(_)) = bind_ip {
+        return Err(anyhow::anyhow!(
+            "IPv6 source IP is incompatible with IPv4 destination"
+        ));
+    }
+
     // Try to create raw ICMP socket
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
         .context("Failed to create raw ICMP socket (need CAP_NET_RAW or root)")?;
+
+    // Bind to source IP if requested so probes leave from --interface / --source.
+    if let Some(IpAddr::V4(v4)) = bind_ip {
+        socket
+            .bind(&SocketAddr::new(IpAddr::V4(v4), 0).into())
+            .with_context(|| format!("Failed to bind raw ICMP socket to {}", v4))?;
+    }
+
+    // On Linux, also pin the socket to the named interface so the kernel
+    // can't reroute the probes via another NIC even if the routing table says so.
+    #[cfg(target_os = "linux")]
+    if let Some(iface) = interface {
+        use std::ffi::CString;
+        use std::os::unix::io::AsRawFd;
+
+        let ifname = CString::new(iface).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
+        })?;
+        unsafe {
+            if libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                ifname.as_ptr() as *const libc::c_void,
+                ifname.as_bytes().len() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(anyhow::anyhow!(
+                    "Failed to bind raw ICMP socket to interface {}: {}",
+                    iface,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = interface;
 
     socket.set_read_timeout(Some(PROBE_TIMEOUT))?;
     socket.set_nonblocking(false)?;
@@ -242,29 +311,43 @@ async fn run_system_traceroute(
     destination_ip: &IpAddr,
     max_hops: u8,
     event_tx: &mpsc::Sender<TestEvent>,
+    bind_ip: Option<IpAddr>,
+    interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
     // Clone strings to avoid lifetime issues with spawn_blocking
     let dest = destination.to_string();
     let dest_ip_str = destination_ip.to_string();
 
-    // Determine which command to use based on OS
+    // Determine which command to use based on OS.
     // Note: -n / -d intentionally NOT passed so the OS resolves hostnames.
+    // Source IP and interface flags differ per platform:
+    //   - tracert (Windows):     -S <srcaddr> only, no interface flag.
+    //   - traceroute (Linux/BSD): -i <interface> and -s <source>.
     let (cmd, args): (&'static str, Vec<String>) = if cfg!(target_os = "windows") {
-        (
-            "tracert",
-            vec!["-h".to_string(), max_hops.to_string(), dest.clone()],
-        )
+        let mut args = vec!["-h".to_string(), max_hops.to_string()];
+        if let Some(ip) = bind_ip {
+            args.push("-S".to_string());
+            args.push(ip.to_string());
+        }
+        args.push(dest.clone());
+        ("tracert", args)
     } else {
-        (
-            "traceroute",
-            vec![
-                "-m".to_string(),
-                max_hops.to_string(),
-                "-q".to_string(),
-                "3".to_string(),
-                dest.clone(),
-            ],
-        )
+        let mut args = vec![
+            "-m".to_string(),
+            max_hops.to_string(),
+            "-q".to_string(),
+            "3".to_string(),
+        ];
+        if let Some(iface) = interface {
+            args.push("-i".to_string());
+            args.push(iface.to_string());
+        }
+        if let Some(ip) = bind_ip {
+            args.push("-s".to_string());
+            args.push(ip.to_string());
+        }
+        args.push(dest.clone());
+        ("traceroute", args)
     };
 
     let output = tokio::task::spawn_blocking(move || Command::new(cmd).args(&args).output())
