@@ -9,7 +9,7 @@ repository = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 homepage = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 documentation = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 keywords = ["cloudflare", "speed-test", "network", "tui", "cli"]
-categories = ["network", "command-line-utilities"]
+categories = ["network-programming", "command-line-utilities"]
 exclude = [
     "images/*",
     "Dockerfile",
