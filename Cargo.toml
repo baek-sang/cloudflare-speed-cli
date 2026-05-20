@@ -10,6 +10,14 @@ homepage = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 documentation = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 keywords = ["cloudflare", "speed-test", "network", "tui", "cli"]
 categories = ["network", "command-line-utilities"]
+exclude = [
+    "images/*",
+    "Dockerfile",
+    "dist-workspace.toml",
+    "flake.nix",
+    "flake.lock",
+    "install.sh",
+]
 
 [dependencies]
 anyhow = "1.0.95"
