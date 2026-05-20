@@ -4,6 +4,7 @@
 
 # cloudflare-speed-cli
 
+[![Crates.io](https://img.shields.io/crates/v/cloudflare-speed-cli.svg)](https://crates.io/crates/cloudflare-speed-cli)
 [![Rust](https://img.shields.io/badge/rust-1.81+-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
@@ -34,9 +35,15 @@ run with `--help` to see full list of features
 
 ## Installation
 
-### From Source
+### Cargo (crates.io)
 
 My preferred way if you have cargo installed:
+
+```bash
+cargo install cloudflare-speed-cli
+```
+
+To install the latest unreleased version from git instead:
 
 ```bash
 cargo install --git https://github.com/kavehtehrani/cloudflare-speed-cli --features tui
