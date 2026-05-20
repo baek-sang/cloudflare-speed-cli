@@ -62,6 +62,7 @@ pub async fn run(args: Cli) -> Result<()> {
         phase: Phase::IdleLatency,
         auto_save: args.auto_save,
         comments: args.comments.clone(),
+        hide_network_info: args.hide_network_info,
         ..Default::default()
     };
     state.initial_history_load_size = initial_load;
@@ -183,6 +184,9 @@ pub async fn run(args: Cli) -> Result<()> {
                                 state.paused = !state.paused;
                                 ctx.ctrl_tx.send(EngineControl::Pause(state.paused)).await.ok();
                             }
+                        }
+                        (_, KeyCode::Char('H')) => {
+                            state.hide_network_info = !state.hide_network_info;
                         }
                         (_, KeyCode::Char('r')) => {
                             // Refresh history (only when on history tab)

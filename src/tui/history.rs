@@ -385,12 +385,19 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
         let line_num = filtered_idx + 1;
 
         // Format interface and network names, truncating if needed
-        let interface = r.interface_name.as_deref().unwrap_or("-");
-        let network = r
-            .network_name
-            .as_deref()
-            .or_else(|| r.interface_name.as_deref())
-            .unwrap_or("-");
+        let interface = if state.hide_network_info {
+            crate::tui::state::REDACTED_PLACEHOLDER
+        } else {
+            r.interface_name.as_deref().unwrap_or("-")
+        };
+        let network = if state.hide_network_info {
+            crate::tui::state::REDACTED_PLACEHOLDER
+        } else {
+            r.network_name
+                .as_deref()
+                .or_else(|| r.interface_name.as_deref())
+                .unwrap_or("-")
+        };
         let history_loss_text = r
             .experimental_udp
             .as_ref()
@@ -550,11 +557,13 @@ pub fn draw_history_detail(area: Rect, f: &mut Frame, state: &mut UiState) {
     ]));
 
     if let Some(result) = filtered_history.get(effective_selected) {
+        let net_label = if state.hide_network_info {
+            crate::tui::state::REDACTED_PLACEHOLDER
+        } else {
+            result.network_name.as_deref().unwrap_or("Unknown Network")
+        };
         header_lines.push(Line::from(vec![
-            Span::styled(
-                result.network_name.as_deref().unwrap_or("Unknown Network"),
-                Style::default().fg(Color::Yellow),
-            ),
+            Span::styled(net_label, Style::default().fg(Color::Yellow)),
             Span::raw(" - "),
             Span::styled(&result.timestamp_utc, Style::default().fg(Color::Gray)),
         ]));

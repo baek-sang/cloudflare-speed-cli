@@ -112,7 +112,13 @@ pub struct UiState {
     /// How far back (in lines) the dashboard's Test Activity panel is scrolled
     /// from the bottom. 0 = pinned to newest (auto-follow).
     pub dashboard_log_scroll: usize,
+    /// When true, identifying network info (IP, MAC, SSID, ISP, server location)
+    /// is rendered as `REDACTED_PLACEHOLDER` in the TUI. Toggled by Shift+H.
+    pub hide_network_info: bool,
 }
+
+/// Display string used in place of identifying network info when redaction is on.
+pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
 
 impl Default for UiState {
     fn default() -> Self {
@@ -203,6 +209,7 @@ impl Default for UiState {
             update_status: None,
             text_log: Vec::new(),
             dashboard_log_scroll: 0,
+            hide_network_info: false,
         }
     }
 }

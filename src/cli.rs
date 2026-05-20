@@ -128,6 +128,11 @@ pub struct Cli {
     /// Number of UDP packets to send for packet loss measurement
     #[arg(long, default_value_t = 50)]
     pub udp_packets: u64,
+
+    /// Redact identifying network info (IP, MAC, SSID, ISP, server location) in the TUI display.
+    /// Useful for sharing screenshots or recording demos. Toggle at runtime with Shift+H.
+    #[arg(long)]
+    pub hide_network_info: bool,
 }
 
 pub async fn run(args: Cli) -> Result<()> {

@@ -39,6 +39,11 @@ pub fn draw_help(area: Rect, f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::raw("  "),
+            Span::styled("H", Style::default().fg(Color::Magenta)),
+            Span::raw("           Toggle redaction of identifying network info"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
             Span::styled("tab", Style::default().fg(Color::Magenta)),
             Span::raw("         Switch tabs"),
         ]),

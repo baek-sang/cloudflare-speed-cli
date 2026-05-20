@@ -13,7 +13,152 @@ use ratatui::{
 
 use super::charts;
 use super::log_style;
-use super::state::{push_wrapped_status_kv, UiState};
+use super::state::{push_wrapped_status_kv, UiState, REDACTED_PLACEHOLDER};
+use std::borrow::Cow;
+
+/// Returns `REDACTED_PLACEHOLDER` when `hide` is true, otherwise `value` or `"-"` for `None`.
+/// Used to conceal identifying network info (IP, MAC, SSID, ISP, location) for
+/// screenshot/demo sharing without altering stored history.
+fn show_or_redact<'a>(value: Option<&'a str>, hide: bool) -> &'a str {
+    if hide {
+        REDACTED_PLACEHOLDER
+    } else {
+        value.unwrap_or("-")
+    }
+}
+
+/// Redacts identifying info from a single Test Activity log line.
+///
+/// Strategy: substring-replace values the engine already populated into `state`
+/// (covers IP/ASN/ISP/server/colo/network/interface). Then pattern-replace any
+/// remaining IPv4 dotted-quads (covers traceroute hops and IP-comparison IPs
+/// that aren't in `state`). Cheap no-op when redaction is off — returns the
+/// borrowed input without allocating.
+fn redact_log_line<'a>(line: &'a str, state: &UiState) -> Cow<'a, str> {
+    if !state.hide_network_info {
+        return Cow::Borrowed(line);
+    }
+
+    let mut needles: Vec<&str> = [
+        state.external_ipv6.as_deref(),
+        state.external_ipv4.as_deref(),
+        state.ip.as_deref(),
+        state.interface_mac.as_deref(),
+        state.as_org.as_deref(),
+        state.network_name.as_deref(),
+        state.interface_name.as_deref(),
+        state.server.as_deref(),
+        state.colo.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|v| v.len() >= 2 && *v != "-")
+    .collect();
+    // Longest-first so e.g. "fe80::1234" isn't half-replaced by a shorter
+    // "1234" needle that snuck in.
+    needles.sort_by_key(|v| std::cmp::Reverse(v.len()));
+
+    let mut s = line.to_string();
+    for needle in needles {
+        s = replace_token(&s, needle, REDACTED_PLACEHOLDER);
+    }
+    s = redact_ipv4_in(&s);
+    Cow::Owned(s)
+}
+
+/// `haystack.replace(needle, replacement)` but only at alphanumeric word
+/// boundaries, so an ASN like `13335` doesn't smear into a throughput value
+/// like `13335.7 Mbps`.
+fn replace_token(haystack: &str, needle: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0;
+    for (i, _) in haystack.match_indices(needle) {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + needle.len()..].chars().next();
+        let is_boundary = |c: Option<char>| match c {
+            None => true,
+            Some(c) => !c.is_alphanumeric(),
+        };
+        if is_boundary(before) && is_boundary(after) {
+            out.push_str(&haystack[last..i]);
+            out.push_str(replacement);
+            last = i + needle.len();
+        }
+    }
+    out.push_str(&haystack[last..]);
+    out
+}
+
+/// Replaces every IPv4 dotted-quad in `s` with `REDACTED_PLACEHOLDER`.
+/// Conservative: requires four 0–255 octets and rejects sequences that are part
+/// of a longer dotted/digit run (so `1.23ms` and `1.2.3.4.5` don't match).
+fn redact_ipv4_in(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            if let Some(end) = ipv4_match_end(bytes, i) {
+                out.push_str(REDACTED_PLACEHOLDER);
+                i = end;
+                continue;
+            }
+        }
+        let cp_end = next_utf8_char_end(bytes, i);
+        out.push_str(std::str::from_utf8(&bytes[i..cp_end]).unwrap_or(""));
+        i = cp_end;
+    }
+    out
+}
+
+fn ipv4_match_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    for octet_idx in 0..4 {
+        if octet_idx > 0 {
+            if bytes.get(i).copied() != Some(b'.') {
+                return None;
+            }
+            i += 1;
+        }
+        let octet_start = i;
+        while i < bytes.len() && (i - octet_start) < 3 && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == octet_start {
+            return None;
+        }
+        let octet: u32 = std::str::from_utf8(&bytes[octet_start..i])
+            .ok()?
+            .parse()
+            .ok()?;
+        if octet > 255 {
+            return None;
+        }
+    }
+    // Reject when extending into a longer number / 5th octet so we don't
+    // grab the leading 4 octets of `1.2.3.4.5`.
+    if let Some(&next) = bytes.get(i) {
+        if next.is_ascii_digit() {
+            return None;
+        }
+        if next == b'.' {
+            if let Some(&peek) = bytes.get(i + 1) {
+                if peek.is_ascii_digit() {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(i)
+}
+
+fn next_utf8_char_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+        i += 1;
+    }
+    i
+}
 
 /// Helper function to get the maximum y value from a series of points
 pub fn max_y(points: &[(f64, f64)]) -> f64 {
@@ -536,6 +681,18 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         ("Wired", Color::Green)
     };
 
+    let hide = state.hide_network_info;
+    let network_display = if hide {
+        REDACTED_PLACEHOLDER.to_string()
+    } else {
+        state
+            .network_name
+            .as_deref()
+            .or_else(|| state.interface_name.as_deref())
+            .unwrap_or("-")
+            .to_string()
+    };
+
     let mut network_lines = vec![
         Line::from(vec![
             Span::styled("Connected via: ", Style::default().fg(Color::Gray)),
@@ -543,25 +700,19 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         ]),
         Line::from(vec![
             Span::styled("Interface: ", Style::default().fg(Color::Gray)),
-            Span::raw(state.interface_name.as_deref().unwrap_or("-")),
+            Span::raw(show_or_redact(state.interface_name.as_deref(), hide).to_string()),
             Span::raw(" ("),
             Span::styled(link_label, Style::default().fg(link_color)),
             Span::raw(")"),
         ]),
         Line::from(vec![
             Span::styled("Network: ", Style::default().fg(Color::Gray)),
-            Span::raw(
-                state
-                    .network_name
-                    .as_deref()
-                    .or_else(|| state.interface_name.as_deref())
-                    .unwrap_or("-"),
-            ),
+            Span::raw(network_display),
         ]),
         Line::from(vec![
             Span::styled("MAC address: ", Style::default().fg(Color::Gray)),
             Span::styled(
-                state.interface_mac.as_deref().unwrap_or("-").to_string(),
+                show_or_redact(state.interface_mac.as_deref(), hide).to_string(),
                 Style::default().fg(Color::Magenta),
             ),
         ]),
@@ -586,7 +737,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     network_lines.push(Line::from(vec![
         Span::styled("Server location: ", Style::default().fg(Color::Gray)),
         Span::styled(
-            state.server.as_deref().unwrap_or("-").to_string(),
+            show_or_redact(state.server.as_deref(), hide).to_string(),
             Style::default().fg(Color::Cyan),
         ),
     ]));
@@ -596,45 +747,55 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         "Your network: ",
         Style::default().fg(Color::Gray),
     )];
-    match (state.as_org.as_deref(), state.asn.as_deref()) {
-        (Some(org), Some(asn)) => {
-            your_network.push(Span::styled(org.to_string(), Style::default().fg(Color::Cyan)));
-            your_network.push(Span::raw(" ("));
-            your_network.push(Span::styled(
-                format!("AS{}", asn),
-                Style::default().fg(Color::Magenta),
-            ));
-            your_network.push(Span::raw(")"));
+    if hide {
+        your_network.push(Span::styled(
+            REDACTED_PLACEHOLDER.to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+    } else {
+        match (state.as_org.as_deref(), state.asn.as_deref()) {
+            (Some(org), Some(asn)) => {
+                your_network.push(Span::styled(org.to_string(), Style::default().fg(Color::Cyan)));
+                your_network.push(Span::raw(" ("));
+                your_network.push(Span::styled(
+                    format!("AS{}", asn),
+                    Style::default().fg(Color::Magenta),
+                ));
+                your_network.push(Span::raw(")"));
+            }
+            (Some(org), None) => {
+                your_network.push(Span::styled(org.to_string(), Style::default().fg(Color::Cyan)));
+            }
+            (None, Some(asn)) => {
+                your_network.push(Span::styled(
+                    format!("AS{}", asn),
+                    Style::default().fg(Color::Magenta),
+                ));
+            }
+            (None, None) => your_network.push(Span::raw("-")),
         }
-        (Some(org), None) => {
-            your_network.push(Span::styled(org.to_string(), Style::default().fg(Color::Cyan)));
-        }
-        (None, Some(asn)) => {
-            your_network.push(Span::styled(
-                format!("AS{}", asn),
-                Style::default().fg(Color::Magenta),
-            ));
-        }
-        (None, None) => your_network.push(Span::raw("-")),
     }
     network_lines.push(Line::from(your_network));
+
+    let external_ipv4_display = if hide {
+        REDACTED_PLACEHOLDER.to_string()
+    } else {
+        state
+            .external_ipv4
+            .as_deref()
+            .unwrap_or(state.ip.as_deref().unwrap_or("-"))
+            .to_string()
+    };
 
     network_lines.extend(vec![
         Line::from(vec![
             Span::styled("External IPv4: ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                state
-                    .external_ipv4
-                    .as_deref()
-                    .unwrap_or(state.ip.as_deref().unwrap_or("-"))
-                    .to_string(),
-                Style::default().fg(Color::Green),
-            ),
+            Span::styled(external_ipv4_display, Style::default().fg(Color::Green)),
         ]),
         Line::from(vec![
             Span::styled("External IPv6: ", Style::default().fg(Color::Gray)),
             Span::styled(
-                state.external_ipv6.as_deref().unwrap_or("-").to_string(),
+                show_or_redact(state.external_ipv6.as_deref(), hide).to_string(),
                 Style::default().fg(Color::Cyan),
             ),
         ]),
@@ -731,10 +892,19 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         ]),
     ]);
 
+    let hide_hint = if state.hide_network_info {
+        " Shift+H to reveal "
+    } else {
+        " Shift+H to hide info "
+    };
     let network_info = Paragraph::new(network_lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Network Information"),
+            .title("Network Information")
+            .title_bottom(
+                Line::from(Span::styled(hide_hint, Style::default().fg(Color::DarkGray)))
+                    .right_aligned(),
+            ),
     );
     f.render_widget(network_info, info_row[0]);
 
@@ -750,7 +920,18 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     } else {
         "Test Activity  (↑↓/PgUp/PgDn to scroll)".to_string()
     };
-    let panel = Block::default().borders(Borders::ALL).title(title);
+    let hide_hint = if state.hide_network_info {
+        " Shift+H to reveal "
+    } else {
+        " Shift+H to hide info "
+    };
+    let panel = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_bottom(
+            Line::from(Span::styled(hide_hint, Style::default().fg(Color::DarkGray)))
+                .right_aligned(),
+        );
     let inner = panel.inner(info_row[1]);
     let visible_rows = inner.height as usize;
 
@@ -770,7 +951,7 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
         let start = end.saturating_sub(visible_rows);
         state.text_log[start..end]
             .iter()
-            .map(|s| log_style::style_log_line(s))
+            .map(|s| log_style::style_log_line(&redact_log_line(s, state)))
             .collect()
     };
 
@@ -1007,7 +1188,7 @@ pub fn draw_dashboard_compact(area: Rect, f: &mut Frame, state: &UiState) {
         ]),
         Line::from(vec![
             Span::styled("Interface: ", Style::default().fg(Color::Gray)),
-            Span::raw(state.interface_name.as_deref().unwrap_or("-")),
+            Span::raw(show_or_redact(state.interface_name.as_deref(), state.hide_network_info).to_string()),
             Span::raw(" ("),
             Span::raw(if state.is_wireless.unwrap_or(false) {
                 "Wireless"
@@ -1018,13 +1199,16 @@ pub fn draw_dashboard_compact(area: Rect, f: &mut Frame, state: &UiState) {
         ]),
         Line::from(vec![
             Span::styled("Network: ", Style::default().fg(Color::Gray)),
-            Span::raw(
+            Span::raw(if state.hide_network_info {
+                REDACTED_PLACEHOLDER.to_string()
+            } else {
                 state
                     .network_name
                     .as_deref()
                     .or_else(|| state.interface_name.as_deref())
-                    .unwrap_or("-"),
-            ),
+                    .unwrap_or("-")
+                    .to_string()
+            }),
         ]),
     ];
 
@@ -1044,18 +1228,19 @@ pub fn draw_dashboard_compact(area: Rect, f: &mut Frame, state: &UiState) {
         ]));
     }
 
+    let hide = state.hide_network_info;
     meta_lines.extend(vec![
         Line::from(vec![
             Span::styled("IP/Colo: ", Style::default().fg(Color::Gray)),
             Span::raw(format!(
                 "{} / {}",
-                state.ip.as_deref().unwrap_or("-"),
-                state.colo.as_deref().unwrap_or("-")
+                show_or_redact(state.ip.as_deref(), hide),
+                show_or_redact(state.colo.as_deref(), hide),
             )),
         ]),
         Line::from(vec![
             Span::styled("Server: ", Style::default().fg(Color::Gray)),
-            Span::raw(state.server.as_deref().unwrap_or("-")),
+            Span::raw(show_or_redact(state.server.as_deref(), hide).to_string()),
         ]),
     ]);
 
@@ -1102,10 +1287,19 @@ pub fn draw_dashboard_compact(area: Rect, f: &mut Frame, state: &UiState) {
         Line::from("Keys: q quit | r rerun | p pause | s save json | tab switch | ? help"),
     ]);
 
+    let hide_hint = if state.hide_network_info {
+        " Shift+H to reveal "
+    } else {
+        " Shift+H to hide info "
+    };
     let meta = Paragraph::new(meta_lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title("Network Information"),
+            .title("Network Information")
+            .title_bottom(
+                Line::from(Span::styled(hide_hint, Style::default().fg(Color::DarkGray)))
+                    .right_aligned(),
+            ),
     );
     f.render_widget(meta, bottom_row[1]);
 }
