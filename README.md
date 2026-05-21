@@ -142,6 +142,7 @@ You can read more about how Cloudflare's speedtest works [here](https://speed.cl
 ## Outstanding Issues
 
 - Network information on Windows is incomplete. I haven't used Windows (outside gaming) in many years and unless there's demand for it I likely won't implement this part. Feel free to open a PR or an issue and we can chat. Honestly the only reason there's a Windows binary at all is because ['cargo-dist'](https://github.com/axodotdev/cargo-dist) made it so easy to do so.
+- Unable to detect the SSID on macOS Sonoma 14.4 and later as this is now considered location-sensitive data.
 
 ## Contributing
 
