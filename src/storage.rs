@@ -59,7 +59,7 @@ pub fn export_csv(path: &Path, result: &RunResult) -> Result<()> {
     }
     let mut out = String::new();
     // Header row with all fields including diagnostics
-    out.push_str("timestamp_utc,base_url,meas_id,comments,server,download_mbps,upload_mbps,idle_mean_ms,idle_median_ms,idle_p25_ms,idle_p75_ms,idle_loss,dl_loaded_mean_ms,dl_loaded_median_ms,dl_loaded_p25_ms,dl_loaded_p75_ms,dl_loaded_loss,ul_loaded_mean_ms,ul_loaded_median_ms,ul_loaded_p25_ms,ul_loaded_p75_ms,ul_loaded_loss,ip,colo,asn,as_org,interface_name,network_name,is_wireless,interface_mac,local_ipv4,local_ipv6,external_ipv4,external_ipv6,dns_resolution_ms,dns_ipv4_count,dns_ipv6_count,dns_servers,tls_handshake_ms,tls_protocol,tls_cipher,ipv4_download_mbps,ipv4_upload_mbps,ipv4_latency_ms,ipv6_download_mbps,ipv6_upload_mbps,ipv6_latency_ms,traceroute_hops\n");
+    out.push_str("timestamp_utc,base_url,meas_id,comments,server,download_mbps,upload_mbps,idle_mean_ms,idle_median_ms,idle_p25_ms,idle_p75_ms,idle_loss,dl_loaded_mean_ms,dl_loaded_median_ms,dl_loaded_p25_ms,dl_loaded_p75_ms,dl_loaded_loss,ul_loaded_mean_ms,ul_loaded_median_ms,ul_loaded_p25_ms,ul_loaded_p75_ms,ul_loaded_loss,ip,colo,asn,as_org,interface_name,network_name,is_wireless,interface_mac,local_ipv4,local_ipv6,external_ipv4,external_ipv6,dns_resolution_ms,dns_ipv4_count,dns_ipv6_count,dns_servers,tls_handshake_ms,tls_protocol,tls_cipher,ipv4_download_mbps,ipv4_upload_mbps,ipv4_latency_ms,ipv6_download_mbps,ipv6_upload_mbps,ipv6_latency_ms,traceroute_hops,bufferbloat_grade,bufferbloat_ms,stability_grade,stability_cv_pct,stability_cv_download_pct,stability_cv_upload_pct\n");
 
     // Extract diagnostic values
     let dns_resolution_ms = result.dns.as_ref().map(|d| d.resolution_time_ms);
@@ -117,8 +117,26 @@ pub fn export_csv(path: &Path, result: &RunResult) -> Result<()> {
     // Traceroute hop count
     let traceroute_hops = result.traceroute.as_ref().map(|t| t.hops.len());
 
+    // Connection quality fields
+    let (cq_bloat_grade, cq_bloat_ms, cq_stab_grade, cq_stab_cv, cq_stab_cv_dl, cq_stab_cv_ul) =
+        match result.connection_quality.as_ref() {
+            Some(cq) => (
+                cq.bufferbloat_grade.clone(),
+                cq.bufferbloat_ms.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                cq.stability_grade.clone(),
+                cq.stability_cv_pct.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                cq.stability_cv_download_pct.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+                cq.stability_cv_upload_pct.map(|v| format!("{:.3}", v)).unwrap_or_default(),
+            ),
+            // Legacy runs (None) emit empty CSV cells. New runs with one half
+            // uncomputable emit the GRADE_UNAVAILABLE sentinel ("-") in the grade
+            // column and an empty value column. Downstream parsers should treat
+            // both empty and "-" as "not available" for the grade columns.
+            None => (String::new(), String::new(), String::new(), String::new(), String::new(), String::new()),
+        };
+
     out.push_str(&format!(
-        "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.6},{:.3},{:.3},{:.3},{:.3},{:.6},{:.3},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+        "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.6},{:.3},{:.3},{:.3},{:.3},{:.6},{:.3},{:.3},{:.3},{:.3},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
         csv_escape(&result.timestamp_utc),
         csv_escape(&result.base_url),
         csv_escape(&result.meas_id),
@@ -168,6 +186,12 @@ pub fn export_csv(path: &Path, result: &RunResult) -> Result<()> {
         ipv6_upload.map(|v| format!("{:.3}", v)).unwrap_or_default(),
         ipv6_latency.map(|v| format!("{:.3}", v)).unwrap_or_default(),
         traceroute_hops.map(|v| v.to_string()).unwrap_or_default(),
+        csv_escape(&cq_bloat_grade),
+        cq_bloat_ms,
+        csv_escape(&cq_stab_grade),
+        cq_stab_cv,
+        cq_stab_cv_dl,
+        cq_stab_cv_ul,
     ));
     std::fs::write(path, out).context("write export csv")?;
     Ok(())

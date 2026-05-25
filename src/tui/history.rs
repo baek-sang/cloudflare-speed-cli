@@ -235,8 +235,8 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
     }
 
     // Add column headers (left-aligned, matching data column widths exactly)
-    // Column widths: # 5, Timestamp 28, DL 10, UL 10, Ping 10, Loss 9, Interface 13, Network 18, Comment fills remainder
-    let fixed_col_width: u16 = 5 + 28 + 10 + 10 + 10 + 9 + 13 + NETWORK_COL_WIDTH as u16;
+    // Column widths: # 5, Timestamp 28, DL 10, UL 10, Ping 10, Loss 9, Bloat 6, Stab 6, Interface 13, Network 18, Comment fills remainder
+    let fixed_col_width: u16 = 5 + 28 + 10 + 10 + 10 + 9 + 6 + 6 + 13 + NETWORK_COL_WIDTH as u16;
     let comment_col_width = area
         .width
         .saturating_sub(fixed_col_width + 2 /* borders */)
@@ -251,6 +251,8 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
         Span::styled("UL        ", Style::default().fg(Color::Cyan)), // 10 chars
         Span::styled("Ping      ", Style::default().fg(Color::Gray)), // 10 chars
         Span::styled("Loss     ", Style::default().fg(Color::Yellow)), // 9 chars
+        Span::styled("Bloat ", Style::default().fg(Color::LightMagenta)), // 6 chars
+        Span::styled("Stab  ", Style::default().fg(Color::LightMagenta)), // 6 chars
         Span::styled("Interface    ", Style::default().fg(Color::Blue)), // 13 chars
         Span::styled(
             format!("{:<width$}", "Network", width = NETWORK_COL_WIDTH),
@@ -404,6 +406,11 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
             .map(|u| format!("{:.1}%", u.latency.loss * 100.0))
             .unwrap_or_else(|| "-".to_string());
 
+        let (bloat_letter, stab_letter) = match &r.connection_quality {
+            Some(cq) => (cq.bufferbloat_grade.as_str(), cq.stability_grade.as_str()),
+            None => ("-", "-"),
+        };
+
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{:<4}{}", line_num, if is_selected { ">" } else { " " }), // 5 chars total
@@ -447,6 +454,23 @@ pub fn show_history(area: Rect, f: &mut Frame, state: &mut UiState) {
                     style
                 } else {
                     Style::default().fg(Color::Yellow)
+                },
+            ),
+            // Width 6 to match the headers exactly.
+            Span::styled(
+                format!("{:<6}", bloat_letter),
+                if is_selected {
+                    style
+                } else {
+                    Style::default().fg(Color::LightMagenta)
+                },
+            ),
+            Span::styled(
+                format!("{:<6}", stab_letter),
+                if is_selected {
+                    style
+                } else {
+                    Style::default().fg(Color::LightMagenta)
                 },
             ),
             Span::styled(

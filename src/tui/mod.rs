@@ -523,7 +523,9 @@ pub async fn run(args: Cli) -> Result<()> {
                         if let Some(ctx) = &mut run_ctx {
                             if let Some(h) = ctx.handle.take() {
                             match h.await {
-                                Ok(Ok(r)) => {
+                                Ok(Ok(mut r)) => {
+                                    r.connection_quality =
+                                        crate::quality::compute(&r, &state.dl_points, &state.ul_points);
                                     if state.auto_save {
                                         save_and_show_path(&r, &mut state);
                                     }

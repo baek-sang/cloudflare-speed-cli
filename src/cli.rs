@@ -236,42 +236,50 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
 }
 
 /// Common function to run the test engine and process results.
-/// `silent` controls whether to consume events and suppress output.
+/// `silent` controls whether JSON is printed and whether save errors propagate.
 async fn run_test_engine(args: Cli, silent: bool) -> Result<()> {
     let cfg = build_config(&args)?;
     let network_info = crate::network::gather_network_info(&args);
-    let enriched = if silent {
-        // In silent mode, spawn task and consume events
-        let (evt_tx, mut evt_rx) = mpsc::channel::<TestEvent>(2048);
-        let (_, ctrl_rx) = mpsc::channel::<EngineControl>(16);
 
-        let engine = TestEngine::new(cfg);
-        let handle = tokio::spawn(async move { engine.run(evt_tx, ctrl_rx).await });
+    let (evt_tx, mut evt_rx) = mpsc::channel::<TestEvent>(2048);
+    let (_, ctrl_rx) = mpsc::channel::<EngineControl>(16);
 
-        // Consume events silently (no output)
-        while let Some(_ev) = evt_rx.recv().await {
-            // All events are silently consumed - no output
+    let engine = TestEngine::new(cfg);
+    let handle = tokio::spawn(async move { engine.run(evt_tx, ctrl_rx).await });
+
+    // Collect throughput samples for connection-quality computation.
+    let run_start = std::time::Instant::now();
+    let mut dl_points: Vec<(f64, f64)> = Vec::new();
+    let mut ul_points: Vec<(f64, f64)> = Vec::new();
+
+    while let Some(ev) = evt_rx.recv().await {
+        if let TestEvent::ThroughputTick {
+            phase, bps_instant, ..
+        } = ev
+        {
+            if matches!(
+                phase,
+                crate::model::Phase::Download | crate::model::Phase::Upload
+            ) {
+                let elapsed = run_start.elapsed().as_secs_f64();
+                let mbps = (bps_instant * 8.0) / 1_000_000.0;
+                match phase {
+                    crate::model::Phase::Download => dl_points.push((elapsed, mbps)),
+                    crate::model::Phase::Upload => ul_points.push((elapsed, mbps)),
+                    _ => {}
+                }
+            }
         }
+    }
 
-        let result = handle
-            .await
-            .context("test engine task failed")?
-            .context("speed test failed")?;
+    let mut result = handle
+        .await
+        .context("test engine task failed")?
+        .context("speed test failed")?;
 
-        crate::network::enrich_result(&result, &network_info)
-    } else {
-        // In JSON mode, directly await the engine (no need to consume events)
-        let (evt_tx, _) = mpsc::channel::<TestEvent>(1024);
-        let (_, ctrl_rx) = mpsc::channel::<EngineControl>(16);
+    result.connection_quality = crate::quality::compute(&result, &dl_points, &ul_points);
 
-        let engine = TestEngine::new(cfg);
-        let result = engine
-            .run(evt_tx, ctrl_rx)
-            .await
-            .context("speed test failed")?;
-
-        crate::network::enrich_result(&result, &network_info)
-    };
+    let enriched = crate::network::enrich_result(&result, &network_info);
 
     // Handle exports (errors will propagate)
     handle_exports(&args, &enriched)?;
@@ -285,10 +293,8 @@ async fn run_test_engine(args: Cli, silent: bool) -> Result<()> {
     if args.auto_save {
         if silent {
             crate::storage::save_run(&enriched).context("failed to save run results")?;
-        } else {
-            if let Ok(p) = crate::storage::save_run(&enriched) {
-                eprintln!("{}", crate::event_format::format_saved_line(&p));
-            }
+        } else if let Ok(p) = crate::storage::save_run(&enriched) {
+            eprintln!("{}", crate::event_format::format_saved_line(&p));
         }
     }
 
@@ -358,7 +364,10 @@ async fn run_text(args: Cli) -> Result<()> {
         }
     }
 
-    let result = handle.await??;
+    let mut result = handle.await??;
+
+    result.connection_quality =
+        crate::quality::compute(&result, &dl_points, &ul_points);
 
     // Gather network information and enrich result
     let network_info = crate::network::gather_network_info(&args);

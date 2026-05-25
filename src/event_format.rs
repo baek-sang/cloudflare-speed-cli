@@ -248,5 +248,67 @@ pub fn format_result_summary(
         ));
     }
 
+    if let Some(ref cq) = result.connection_quality {
+        if let Some(ms) = cq.bufferbloat_ms {
+            out.push(format!("Bufferbloat: {} ({:.0}ms)", cq.bufferbloat_grade, ms));
+        }
+        if let Some(cv) = cq.stability_cv_pct {
+            let mut detail = format!("CV {:.1}%", cv);
+            if let Some(dl) = cq.stability_cv_download_pct {
+                detail.push_str(&format!(", DL {:.1}%", dl));
+            }
+            if let Some(ul) = cq.stability_cv_upload_pct {
+                detail.push_str(&format!(", UL {:.1}%", ul));
+            }
+            out.push(format!("Stability: {} ({})", cq.stability_grade, detail));
+        }
+    }
+
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{empty_run_result, ConnectionQuality};
+
+    #[test]
+    fn summary_omits_connection_quality_when_absent() {
+        let r = empty_run_result();
+        let out = format_result_summary(&r, &[], &[], &[], &[], &[]);
+        assert!(!out.iter().any(|l| l.starts_with("Bufferbloat:")));
+        assert!(!out.iter().any(|l| l.starts_with("Stability:")));
+    }
+
+    #[test]
+    fn summary_includes_connection_quality_when_present() {
+        let mut r = empty_run_result();
+        r.connection_quality = Some(ConnectionQuality {
+            bufferbloat_grade: "B".into(),
+            bufferbloat_ms: Some(47.3),
+            stability_grade: "A".into(),
+            stability_cv_pct: Some(3.8),
+            stability_cv_download_pct: Some(3.1),
+            stability_cv_upload_pct: Some(3.8),
+        });
+        let out = format_result_summary(&r, &[], &[], &[], &[], &[]);
+        assert!(out.iter().any(|l| l == "Bufferbloat: B (47ms)"));
+        assert!(out.iter().any(|l| l == "Stability: A (CV 3.8%, DL 3.1%, UL 3.8%)"));
+    }
+
+    #[test]
+    fn summary_skips_per_direction_when_unavailable() {
+        let mut r = empty_run_result();
+        r.connection_quality = Some(ConnectionQuality {
+            bufferbloat_grade: "-".into(),
+            bufferbloat_ms: None,
+            stability_grade: "A".into(),
+            stability_cv_pct: Some(5.0),
+            stability_cv_download_pct: None,
+            stability_cv_upload_pct: Some(5.0),
+        });
+        let out = format_result_summary(&r, &[], &[], &[], &[], &[]);
+        assert!(!out.iter().any(|l| l.starts_with("Bufferbloat:")));
+        assert!(out.iter().any(|l| l == "Stability: A (CV 5.0%, UL 5.0%)"));
+    }
 }

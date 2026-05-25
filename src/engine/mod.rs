@@ -450,6 +450,7 @@ impl TestEngine {
             tls: tls_summary,
             ip_comparison: ip_comparison_result,
             traceroute: traceroute_summary,
+            connection_quality: None,
         })
     }
 }

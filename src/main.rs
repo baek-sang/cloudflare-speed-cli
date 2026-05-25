@@ -1,9 +1,11 @@
 mod cli;
+mod constants;
 mod engine;
 mod event_format;
 mod metrics;
 mod model;
 mod network;
+mod quality;
 mod stats;
 mod storage;
 #[cfg(feature = "tui")]
