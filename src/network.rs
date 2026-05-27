@@ -366,20 +366,40 @@ fn get_wireless_ssid(iface: &str) -> Option<String> {
         .output()
         .ok()?;
 
+    if !output.status.success() {
+        return None;
+    }
+
     let output_str = String::from_utf8_lossy(&output.stdout);
 
     for line in output_str.lines() {
-        if let Some(idx) = line.find("ssid ") {
-            let rest = line[idx + 5..].trim_start();
+        let mut tokens = line.split_whitespace();
 
-            if rest.starts_with('"') {
-                // ssid "an example ssid" channel 1 ...
-                let end_idx = rest[1..].find('"')?;
-                return Some(rest[1..end_idx + 1].to_string());
-            } else {
-                // ssid an_example_ssid channel 1 ...
-                let end_idx = rest.find(' ').unwrap_or(rest.len());
-                return Some(rest[..end_idx].to_string());
+        while let Some(tok) = tokens.next() {
+            if tok == "ssid" || tok == "meshid" {
+                if let Some(next_tok) = tokens.next() {
+                    if next_tok.starts_with('"') {
+                        // If the SSID contains whitespace, it's double quoted
+                        // ssid "an example ssid" channel 1 ...
+                        let mut ssid = next_tok.trim_start_matches('"').to_string();
+
+                        for next_tok in tokens.by_ref() {
+                            ssid.push(' ');
+                            if next_tok.ends_with('"') {
+                                ssid.push_str(next_tok.trim_end_matches('"'));
+                                break;
+                            } else {
+                                ssid.push_str(next_tok);
+                            }
+                        }
+
+                        return Some(ssid);
+                    } else {
+                        // No double quotation if no white space
+                        // ssid an_example_ssid channel 1 ...
+                        return Some(next_tok.to_string());
+                    }
+                }
             }
         }
     }
