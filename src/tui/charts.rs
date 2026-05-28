@@ -59,22 +59,16 @@ pub fn render_box_plot_with_metrics_inside(
         .split(inner);
 
     // Render box plot in top area (without its own borders, we'll add them to the whole area)
-    if samples.len() >= 2 {
-        // Create box plot without borders (we'll add borders to the whole widget)
+    if !samples.is_empty() {
         let mut sorted = samples.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len();
-        let (min_val, max_val, q1, med, q3, mean) = if n >= 2 {
-            let min = sorted[0];
-            let q1_val = sorted[n / 4];
-            let med_val = sorted[n / 2];
-            let q3_val = sorted[3 * n / 4];
-            let max = sorted[n - 1];
-            let mean_val = samples.iter().sum::<f64>() / samples.len() as f64;
-            (min, max, q1_val, med_val, q3_val, mean_val)
-        } else {
-            (0.0, 1.0, 0.0, 0.0, 0.0, 0.0)
-        };
+        let min_val = sorted[0];
+        let max_val = sorted[n - 1];
+        let q1 = sorted[n / 4];
+        let med = sorted[n / 2];
+        let q3 = sorted[3 * n / 4];
+        let mean = samples.iter().sum::<f64>() / n as f64;
 
         let canvas = Canvas::default()
             .x_bounds([min_val - 0.5, max_val + 0.5])
@@ -100,6 +94,9 @@ pub fn render_box_plot_with_metrics_inside(
                     // Whisker caps
                     draw_line(ctx, min_val, -0.2, min_val, 0.2, Color::White);
                     draw_line(ctx, max_val, -0.2, max_val, 0.2, Color::White);
+                } else {
+                    // Single sample: just mark the point
+                    draw_line(ctx, med, -0.4, med, 0.4, Color::Yellow);
                 }
             });
         f.render_widget(canvas, chart_metrics[0]);

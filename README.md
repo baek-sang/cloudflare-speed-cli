@@ -4,6 +4,7 @@
 
 # cloudflare-speed-cli
 
+[![Crates.io](https://img.shields.io/crates/v/cloudflare-speed-cli.svg)](https://crates.io/crates/cloudflare-speed-cli)
 [![Rust](https://img.shields.io/badge/rust-1.81+-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
 
@@ -18,18 +19,31 @@ A CLI tool that displays network speed test results from Cloudflare's speed test
 
 ## Features
 
-- **Speed Tests**: Measures download/upload throughput, idle latency, and loaded latency
+- **Speed Tests**: Download/upload throughput, idle latency, and loaded latency
+- **Diagnostics**: DNS resolution and TLS handshake timing run alongside every test
+- **UDP Quality**: Packet loss, jitter, and MOS-style link scoring
+- **IPv4 vs IPv6**: Optional side-by-side comparison (`--compare-ip-versions`)
+- **Traceroute**: Optional ICMP traceroute to the Cloudflare edge (`--traceroute`)
+- **Proxy Support**: Route through HTTP, HTTPS, or SOCKS5 proxies (`--proxy`)
+- **TLS Trust**: Loads OS truststore, or supply a private CA with `--certificate`
+- **Interface Binding**: Bind to a specific network interface or source IP
 - **Interactive TUI**: Real-time charts and statistics
 - **History**: View and manage past test results
-- **Export**: Save results as JSON
-- **Text/JSON Modes**: Headless operation for scripting
-- **Interface Binding**: Bind to specific network interface or source IP
+- **Export**: Save results as JSON or CSV. headless text/JSON modes for scripting
+
+run with `--help` to see full list of features
 
 ## Installation
 
-### From Source
+### Cargo (crates.io)
 
 My preferred way if you have cargo installed:
+
+```bash
+cargo install cloudflare-speed-cli
+```
+
+To install the latest unreleased version from git instead:
 
 ```bash
 cargo install --git https://github.com/kavehtehrani/cloudflare-speed-cli --features tui
@@ -42,6 +56,14 @@ This works for both older Intel and newer Silicon Mac computers.
 ```bash
 brew tap kavehtehrani/tap
 brew install cloudflare-speed-cli
+```
+
+### MacPorts
+
+Supports both Intel and Apple Silicon Macs. The package is available on the [official MacPorts repository](https://ports.macports.org/port/cloudflare-speed-cli/) and can be installed with:
+
+```bash
+sudo port install cloudflare-speed-cli
 ```
 
 ### Installation Script
@@ -120,6 +142,7 @@ You can read more about how Cloudflare's speedtest works [here](https://speed.cl
 ## Outstanding Issues
 
 - Network information on Windows is incomplete. I haven't used Windows (outside gaming) in many years and unless there's demand for it I likely won't implement this part. Feel free to open a PR or an issue and we can chat. Honestly the only reason there's a Windows binary at all is because ['cargo-dist'](https://github.com/axodotdev/cargo-dist) made it so easy to do so.
+- Unable to detect the SSID on macOS Sonoma 14.4 and later as this is now considered location-sensitive data.
 
 ## Contributing
 

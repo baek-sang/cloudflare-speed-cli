@@ -1,6 +1,6 @@
 [package]
 name = "cloudflare-speed-cli"
-version = "0.6.6"
+version = "1.0.1"
 edition = "2021"
 authors = ["kavehtehrani <codemonkey13x@gmail.com>"]
 description = "CLI tool for Cloudflare speed testing with TUI interface"
@@ -9,23 +9,33 @@ repository = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 homepage = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 documentation = "https://github.com/kavehtehrani/cloudflare-speed-cli"
 keywords = ["cloudflare", "speed-test", "network", "tui", "cli"]
-categories = ["network", "command-line-utilities"]
+categories = ["network-programming", "command-line-utilities"]
+exclude = [
+    "images/*",
+    "Dockerfile",
+    "dist-workspace.toml",
+    "flake.nix",
+    "flake.lock",
+    "install.sh",
+]
 
 [dependencies]
 anyhow = "1.0.95"
+base64 = "0.22"
 bytes = "1.9.0"
 clap = { version = "4.5.23", features = ["derive"] }
-crossterm = { version = "0.28.1", optional = true, features = ["event-stream"] }
+crossterm = { version = "0.29", optional = true, features = ["event-stream"] }
 dirs = "5.0.1"
 futures = "0.3.31"
 humantime-serde = "1.1.1"
 humantime = "2.1.0"
 if-addrs = "0.10"
 rand = "0.8.5"
-ratatui = { version = "0.29.0", optional = true, default-features = false, features = ["crossterm"] }
-reqwest = { version = "0.12.9", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "deflate", "json", "stream", "socks"] }
+ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.12.9", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "http2", "gzip", "brotli", "deflate", "json", "stream", "socks"] }
 libc = "0.2"
 arboard = { version = "3.3", optional = true }
+ratatui-textarea = { version = "0.9", optional = true, features = ["search"] }
 serde = { version = "1.0.216", features = ["derive"] }
 serde_json = "1.0.133"
 socket2 = { version = "0.5", features = ["all"] }
@@ -36,6 +46,7 @@ tokio = { version = "1.41.1", features = ["macros", "rt-multi-thread", "signal",
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 webpki-roots = "0.26"
+rustls-native-certs = "0.8"
 
 # Traceroute (ICMP packet parsing)
 pnet_packet = "0.35"
@@ -46,7 +57,7 @@ path = "src/main.rs"
 
 [features]
 default = ["tui"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:arboard"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:arboard", "dep:ratatui-textarea"]
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -24,16 +24,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Run traceroute to the destination.
 ///
 /// Tries raw ICMP first, falls back to system traceroute if that fails.
+/// When `bind_ip` is set, the destination is resolved to an address of the
+/// matching family and the probe is sourced from that IP. When `interface`
+/// is set on Linux, `SO_BINDTODEVICE` keeps probes on that NIC.
 pub async fn run_traceroute(
     destination: &str,
     max_hops: u8,
     event_tx: &mpsc::Sender<TestEvent>,
+    bind_ip: Option<IpAddr>,
+    interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
-    // Resolve destination to IP
-    let ip = resolve_destination(destination)?;
+    // Resolve destination to IP, preferring the bind IP's family when set.
+    let ip = resolve_destination(destination, bind_ip)?;
 
     // Try raw ICMP first
-    match run_icmp_traceroute(&ip, max_hops, event_tx).await {
+    match run_icmp_traceroute(&ip, max_hops, event_tx, bind_ip, interface).await {
         Ok(summary) => return Ok(summary),
         Err(e) => {
             // Send info about fallback
@@ -46,24 +51,40 @@ pub async fn run_traceroute(
     }
 
     // Fall back to system traceroute
-    run_system_traceroute(destination, &ip, max_hops, event_tx).await
+    run_system_traceroute(destination, &ip, max_hops, event_tx, bind_ip, interface).await
 }
 
-/// Resolve destination hostname to IP address.
-fn resolve_destination(destination: &str) -> Result<IpAddr> {
+/// Resolve destination hostname to IP address. When `bind_ip` is set, prefer
+/// a resolved address of the same family; if none exists, error rather than
+/// returning an address the bound socket can't reach.
+fn resolve_destination(destination: &str, bind_ip: Option<IpAddr>) -> Result<IpAddr> {
     // Try to parse as IP first
     if let Ok(ip) = destination.parse::<IpAddr>() {
         return Ok(ip);
     }
 
     // Try DNS resolution
-    let addr = format!("{}:0", destination)
+    let addrs: Vec<IpAddr> = format!("{}:0", destination)
         .to_socket_addrs()
         .with_context(|| format!("Failed to resolve {}", destination))?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("No addresses found for {}", destination))?;
+        .map(|a| a.ip())
+        .collect();
 
-    Ok(addr.ip())
+    if addrs.is_empty() {
+        return Err(anyhow::anyhow!("No addresses found for {}", destination));
+    }
+
+    match bind_ip {
+        Some(IpAddr::V4(_)) => addrs
+            .into_iter()
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| anyhow::anyhow!("No IPv4 address for {} matches bind IP family", destination)),
+        Some(IpAddr::V6(_)) => addrs
+            .into_iter()
+            .find(|a| a.is_ipv6())
+            .ok_or_else(|| anyhow::anyhow!("No IPv6 address for {} matches bind IP family", destination)),
+        None => Ok(addrs.into_iter().next().unwrap()),
+    }
 }
 
 /// Run traceroute using raw ICMP sockets (requires elevated privileges).
@@ -71,6 +92,8 @@ async fn run_icmp_traceroute(
     destination: &IpAddr,
     max_hops: u8,
     event_tx: &mpsc::Sender<TestEvent>,
+    bind_ip: Option<IpAddr>,
+    interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
     // Check if we're dealing with IPv4 - IPv6 traceroute is more complex
     let dest_v4 = match destination {
@@ -82,9 +105,55 @@ async fn run_icmp_traceroute(
         }
     };
 
+    // Refuse a v6 bind against a v4 destination - the socket would error on
+    // bind() anyway, so fail fast with a clearer message.
+    if let Some(IpAddr::V6(_)) = bind_ip {
+        return Err(anyhow::anyhow!(
+            "IPv6 source IP is incompatible with IPv4 destination"
+        ));
+    }
+
     // Try to create raw ICMP socket
     let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::ICMPV4))
         .context("Failed to create raw ICMP socket (need CAP_NET_RAW or root)")?;
+
+    // Bind to source IP if requested so probes leave from --interface / --source.
+    if let Some(IpAddr::V4(v4)) = bind_ip {
+        socket
+            .bind(&SocketAddr::new(IpAddr::V4(v4), 0).into())
+            .with_context(|| format!("Failed to bind raw ICMP socket to {}", v4))?;
+    }
+
+    // On Linux, also pin the socket to the named interface so the kernel
+    // can't reroute the probes via another NIC even if the routing table says so.
+    #[cfg(target_os = "linux")]
+    if let Some(iface) = interface {
+        use std::ffi::CString;
+        use std::os::unix::io::AsRawFd;
+
+        let ifname = CString::new(iface).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid interface name")
+        })?;
+        unsafe {
+            if libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                ifname.as_ptr() as *const libc::c_void,
+                ifname.as_bytes().len() as libc::socklen_t,
+            ) != 0
+            {
+                return Err(anyhow::anyhow!(
+                    "Failed to bind raw ICMP socket to interface {}: {}",
+                    iface,
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = interface;
 
     socket.set_read_timeout(Some(PROBE_TIMEOUT))?;
     socket.set_nonblocking(false)?;
@@ -242,40 +311,58 @@ async fn run_system_traceroute(
     destination_ip: &IpAddr,
     max_hops: u8,
     event_tx: &mpsc::Sender<TestEvent>,
+    bind_ip: Option<IpAddr>,
+    interface: Option<&str>,
 ) -> Result<TracerouteSummary> {
     // Clone strings to avoid lifetime issues with spawn_blocking
     let dest = destination.to_string();
     let dest_ip_str = destination_ip.to_string();
 
-    // Determine which command to use based on OS
+    // Determine which command to use based on OS.
+    // Note: -n / -d intentionally NOT passed so the OS resolves hostnames.
+    // Source IP and interface flags differ per platform:
+    //   - tracert (Windows):     -S <srcaddr> only, no interface flag.
+    //   - traceroute (Linux/BSD): -i <interface> and -s <source>.
     let (cmd, args): (&'static str, Vec<String>) = if cfg!(target_os = "windows") {
-        (
-            "tracert",
-            vec![
-                "-h".to_string(),
-                max_hops.to_string(),
-                "-d".to_string(),
-                dest.clone(),
-            ],
-        )
+        let mut args = vec!["-h".to_string(), max_hops.to_string()];
+        if let Some(ip) = bind_ip {
+            args.push("-S".to_string());
+            args.push(ip.to_string());
+        }
+        args.push(dest.clone());
+        ("tracert", args)
     } else {
-        (
-            "traceroute",
-            vec![
-                "-m".to_string(),
-                max_hops.to_string(),
-                "-n".to_string(),
-                "-q".to_string(),
-                "3".to_string(),
-                dest.clone(),
-            ],
-        )
+        let mut args = vec![
+            "-m".to_string(),
+            max_hops.to_string(),
+            "-q".to_string(),
+            "3".to_string(),
+        ];
+        if let Some(iface) = interface {
+            args.push("-i".to_string());
+            args.push(iface.to_string());
+        }
+        if let Some(ip) = bind_ip {
+            args.push("-s".to_string());
+            args.push(ip.to_string());
+        }
+        args.push(dest.clone());
+        ("traceroute", args)
     };
 
     let output = tokio::task::spawn_blocking(move || Command::new(cmd).args(&args).output())
         .await
         .context("Traceroute task failed")?
         .context("Failed to execute traceroute command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "traceroute exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let hops = parse_traceroute_output(&stdout, event_tx).await;
@@ -331,16 +418,19 @@ async fn parse_traceroute_output(
 }
 
 /// Parse a single hop line from traceroute output.
+///
+/// Handles three formats:
+/// - Linux/macOS with DNS:    `1  host.name (1.2.3.4)  0.5 ms 0.4 ms 0.6 ms`
+/// - Linux/macOS without DNS: `1  1.2.3.4  0.5 ms 0.4 ms 0.6 ms`
+/// - Windows with DNS:        `1  <1 ms <1 ms <1 ms  host.name [1.2.3.4]`
 fn parse_hop_line(line: &str) -> Option<TracerouteHop> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return None;
     }
 
-    // First part should be hop number
     let hop_number: u8 = parts.first()?.parse().ok()?;
 
-    // Check for timeout line (all asterisks)
     if parts.iter().skip(1).all(|p| *p == "*") {
         return Some(TracerouteHop {
             hop_number,
@@ -351,37 +441,44 @@ fn parse_hop_line(line: &str) -> Option<TracerouteHop> {
         });
     }
 
-    // Find IP address and RTT values
     let mut ip_address: Option<String> = None;
+    let mut hostname: Option<String> = None;
     let mut rtts: Vec<f64> = Vec::new();
+    let mut prev_candidate: Option<String> = None;
 
     for part in parts.iter().skip(1) {
-        // Skip "ms" markers
         if *part == "ms" {
             continue;
         }
 
-        // Try to parse as RTT (number)
-        if let Ok(rtt) = part.trim_end_matches("ms").parse::<f64>() {
+        // Numeric RTT (handles plain `0.5`, `0.5ms`, and Windows `<1`).
+        let cleaned = part.trim_start_matches('<').trim_end_matches("ms");
+        if let Ok(rtt) = cleaned.parse::<f64>() {
             rtts.push(rtt);
+            prev_candidate = None;
             continue;
         }
 
-        // Handle Windows "<1 ms" format
-        if part.starts_with('<') {
-            if let Ok(rtt) = part
-                .trim_start_matches('<')
-                .trim_end_matches("ms")
-                .parse::<f64>()
-            {
-                rtts.push(rtt);
-                continue;
-            }
-        }
+        let was_wrapped = part.starts_with('(') || part.starts_with('[');
+        let stripped = part
+            .trim_start_matches(['(', '['])
+            .trim_end_matches([')', ']']);
 
-        // Try to parse as IP address
-        if part.parse::<IpAddr>().is_ok() || (part.contains('.') && !part.contains("ms")) {
-            ip_address = Some(part.to_string());
+        if stripped.parse::<IpAddr>().is_ok() {
+            if ip_address.is_none() {
+                ip_address = Some(stripped.to_string());
+                if was_wrapped {
+                    if let Some(prev) = prev_candidate.take() {
+                        if prev != stripped {
+                            hostname = Some(prev);
+                        }
+                    }
+                }
+            }
+            prev_candidate = None;
+        } else {
+            // Not an IP, not a number: candidate hostname for the next wrapped IP.
+            prev_candidate = Some(part.to_string());
         }
     }
 
@@ -392,8 +489,71 @@ fn parse_hop_line(line: &str) -> Option<TracerouteHop> {
     Some(TracerouteHop {
         hop_number,
         ip_address,
-        hostname: None,
+        hostname,
         rtt_ms: rtts,
         timeout: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_linux_with_hostname() {
+        let line = " 1  host.example.com (1.2.3.4)  0.5 ms  0.4 ms  0.6 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.hop_number, 1);
+        assert_eq!(hop.ip_address.as_deref(), Some("1.2.3.4"));
+        assert_eq!(hop.hostname.as_deref(), Some("host.example.com"));
+        assert_eq!(hop.rtt_ms, vec![0.5, 0.4, 0.6]);
+        assert!(!hop.timeout);
+    }
+
+    #[test]
+    fn parses_linux_without_dns() {
+        let line = " 2  1.2.3.4  0.5 ms 0.4 ms 0.6 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("1.2.3.4"));
+        assert_eq!(hop.hostname, None);
+        assert_eq!(hop.rtt_ms, vec![0.5, 0.4, 0.6]);
+    }
+
+    #[test]
+    fn parses_linux_when_hostname_equals_ip() {
+        // When DNS fails, traceroute often shows `ip (ip)` with both being identical.
+        let line = " 3  10.0.0.1 (10.0.0.1)  5.2 ms 4.8 ms 5.1 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("10.0.0.1"));
+        assert_eq!(hop.hostname, None, "hostname should be elided when same as ip");
+    }
+
+    #[test]
+    fn parses_timeout_line() {
+        let line = " 5  * * *";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address, None);
+        assert_eq!(hop.hostname, None);
+        assert!(hop.timeout);
+        assert!(hop.rtt_ms.is_empty());
+    }
+
+    #[test]
+    fn parses_windows_with_hostname() {
+        let line = "  1    <1 ms    <1 ms    <1 ms  router.local [192.168.1.1]";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("192.168.1.1"));
+        assert_eq!(hop.hostname.as_deref(), Some("router.local"));
+        assert_eq!(hop.rtt_ms, vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn first_ip_wins_on_multi_router_hop() {
+        // Some hops have two routers responding; we keep the first IP/hostname pair.
+        let line = " 5  a.example.com (1.1.1.1)  260.2 ms b.example.com (2.2.2.2)  260.1 ms 260.0 ms";
+        let hop = parse_hop_line(line).unwrap();
+        assert_eq!(hop.ip_address.as_deref(), Some("1.1.1.1"));
+        assert_eq!(hop.hostname.as_deref(), Some("a.example.com"));
+        assert_eq!(hop.rtt_ms.len(), 3);
+    }
 }

@@ -3,7 +3,9 @@ mod dashboard;
 mod export;
 mod help;
 mod history;
+mod log_style;
 mod state;
+mod traceroute;
 
 pub use state::UiState;
 
@@ -33,7 +35,10 @@ use charts::draw_charts;
 use dashboard::draw_dashboard;
 use export::{copy_to_clipboard, enrich_result_with_network_info, export_result_csv, export_result_json, save_and_show_path};
 use help::draw_help;
-use history::{show_history, draw_history_detail};
+use history::{
+    draw_history_comment_modal, draw_history_detail, draw_history_export_modal, draw_history_menu,
+    show_history,
+};
 use state::update_available_networks;
 
 pub async fn run(args: Cli) -> Result<()> {
@@ -57,6 +62,7 @@ pub async fn run(args: Cli) -> Result<()> {
         phase: Phase::IdleLatency,
         auto_save: args.auto_save,
         comments: args.comments.clone(),
+        hide_network_info: args.hide_network_info,
         ..Default::default()
     };
     state.initial_history_load_size = initial_load;
@@ -79,6 +85,8 @@ pub async fn run(args: Cli) -> Result<()> {
         .and_then(|n| n.to_str())
         .map(|s| s.to_string());
     state.proxy_url = args.proxy.clone();
+    state.traceroute_enabled = args.traceroute;
+    state.traceroute_max_hops = args.traceroute_max_hops;
 
     // Spawn background task to check for updates (non-blocking, silent on error)
     let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -140,32 +148,27 @@ pub async fn run(args: Cli) -> Result<()> {
                         continue;
                     }
 
+                    // Handle comment editor modal (text input mode)
+                    if state.tab == 1 && state.history_comment_modal_open {
+                        handle_history_comment_modal_key(&mut state, k);
+                        continue;
+                    }
+
+                    // Handle export result modal (when on history tab and modal is open)
+                    if state.tab == 1 && state.history_export_modal_open {
+                        handle_history_export_modal_key(&mut state, k.code);
+                        continue;
+                    }
+
+                    // Handle context menu mode (when on history tab and menu is open)
+                    if state.tab == 1 && state.history_menu_open {
+                        handle_history_menu_key(&mut state, k.code);
+                        continue;
+                    }
+
                     // Handle detail view mode (when on history tab and viewing JSON detail)
                     if state.tab == 1 && state.history_detail_view {
-                        match k.code {
-                            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
-                                // Exit detail view
-                                state.history_detail_view = false;
-                                state.history_detail_scroll = 0;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                // Scroll up
-                                state.history_detail_scroll =
-                                    state.history_detail_scroll.saturating_sub(1);
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                // Scroll down
-                                state.history_detail_scroll += 1;
-                            }
-                            KeyCode::PageUp => {
-                                state.history_detail_scroll =
-                                    state.history_detail_scroll.saturating_sub(20);
-                            }
-                            KeyCode::PageDown => {
-                                state.history_detail_scroll += 20;
-                            }
-                            _ => {}
-                        }
+                        handle_history_detail_key(&mut state, k);
                         continue;
                     }
 
@@ -181,6 +184,9 @@ pub async fn run(args: Cli) -> Result<()> {
                                 state.paused = !state.paused;
                                 ctx.ctrl_tx.send(EngineControl::Pause(state.paused)).await.ok();
                             }
+                        }
+                        (_, KeyCode::Char('H')) => {
+                            state.hide_network_info = !state.hide_network_info;
                         }
                         (_, KeyCode::Char('r')) => {
                             // Refresh history (only when on history tab)
@@ -269,6 +275,9 @@ pub async fn run(args: Cli) -> Result<()> {
                                 state.tls_summary = None;
                                 state.ip_comparison = None;
                                 state.traceroute_summary = None;
+                                state.traceroute_hops.clear();
+                                state.text_log.clear();
+                                state.dashboard_log_scroll = 0;
                                 run_ctx = Some(start_run(&args).await?);
                             }
                         }
@@ -282,64 +291,6 @@ pub async fn run(args: Cli) -> Result<()> {
                                 }
                             }
                         }
-                        // Export functions only work in history tab
-                        (_, KeyCode::Char('e')) => {
-                            if state.tab == 1 && !state.history.is_empty() {
-                                if state.history_selected < state.history.len() {
-                                    let r = &state.history[state.history_selected];
-                                    match export_result_json(r, &state) {
-                                        Ok(p) => {
-                                            let path_str = p.to_string_lossy().to_string();
-                                            state.last_exported_path = Some(path_str.clone());
-                                            state.info = format!("Exported JSON: {} (press 'y' to copy path)", p.display());
-                                        }
-                                        Err(e) => {
-                                            state.info = format!("JSON export failed: {e:#}");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        (_, KeyCode::Char('c')) => {
-                            if state.tab == 1 && !state.history.is_empty() {
-                                if state.history_selected < state.history.len() {
-                                    let r = &state.history[state.history_selected];
-                                    match export_result_csv(r, &state) {
-                                        Ok(p) => {
-                                            let path_str = p.to_string_lossy().to_string();
-                                            state.last_exported_path = Some(path_str.clone());
-                                            state.info = format!("Exported CSV: {} (press 'y' to copy path)", p.display());
-                                        }
-                                        Err(e) => {
-                                            state.info = format!("CSV export failed: {e:#}");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        (_, KeyCode::Char('y')) => {
-                            // Copy last exported path to clipboard (yank)
-                            if state.tab == 1 {
-                                if let Some(ref path) = state.last_exported_path {
-                                    match copy_to_clipboard(path) {
-                                        Ok(_) => {
-                                            // Truncate very long paths in the message
-                                            let display_path = if path.len() > 60 {
-                                                format!("{}...", &path[..57])
-                                            } else {
-                                                path.clone()
-                                            };
-                                            state.info = format!("✓ Copied to clipboard: {}", display_path);
-                                        }
-                                        Err(e) => {
-                                            state.info = format!("Clipboard copy failed: {e:#}");
-                                        }
-                                    }
-                                } else {
-                                    state.info = "No exported file path to copy. Export a file first (e/c)".into();
-                                }
-                            }
-                        }
                         (_, KeyCode::Char('a')) => {
                             state.auto_save = !state.auto_save;
                             state.info = if state.auto_save {
@@ -350,7 +301,8 @@ pub async fn run(args: Cli) -> Result<()> {
                         }
                         (KeyModifiers::SHIFT, KeyCode::BackTab) => {
                             // Shift+Tab cycles backwards
-                            let new_tab = if state.tab == 0 { 3 } else { state.tab - 1 };
+                            let tab_count = if state.traceroute_enabled { 5 } else { 4 };
+                            let new_tab = if state.tab == 0 { tab_count - 1 } else { state.tab - 1 };
                             state.tab = new_tab;
                             if new_tab == 1 {
                                 state.history_selected = 0;
@@ -358,7 +310,8 @@ pub async fn run(args: Cli) -> Result<()> {
                             }
                         }
                         (_, KeyCode::Tab) => {
-                            let new_tab = (state.tab + 1) % 4;
+                            let tab_count = if state.traceroute_enabled { 5 } else { 4 };
+                            let new_tab = (state.tab + 1) % tab_count;
                             state.tab = new_tab;
                             // Reset history selection when switching to history tab
                             if new_tab == 1 {
@@ -367,7 +320,25 @@ pub async fn run(args: Cli) -> Result<()> {
                             }
                         }
                         (_, KeyCode::Char('?')) => {
-                            state.tab = 3; // help
+                            state.tab = if state.traceroute_enabled { 4 } else { 3 }; // help
+                        }
+                        (_, KeyCode::Enter) => {
+                            // Quick-open detail view for the selected history row.
+                            if state.tab == 1 {
+                                open_history_detail(&mut state);
+                            }
+                        }
+                        (_, KeyCode::Char(' ')) => {
+                            if state.tab == 1
+                                && !state.history.is_empty()
+                                && !state.history_filter_editing
+                                && !state.history_detail_view
+                                && !state.history_export_modal_open
+                                && !state.history_comment_modal_open
+                            {
+                                state.history_menu_open = true;
+                                state.history_menu_selected = history::MENU_ITEM_VIEW;
+                            }
                         }
                         // History navigation and deletion (only when on History tab)
                         (_, KeyCode::Up) | (_, KeyCode::Char('k')) => {
@@ -375,10 +346,19 @@ pub async fn run(args: Cli) -> Result<()> {
                                 if state.history_selected > 0 {
                                     state.history_selected -= 1;
                                 }
+                            } else if state.tab == 0 {
+                                // Dashboard: scroll Test Activity log back one line.
+                                let max_scroll = state.text_log.len().saturating_sub(1);
+                                state.dashboard_log_scroll =
+                                    (state.dashboard_log_scroll + 1).min(max_scroll);
                             }
                         }
                         (_, KeyCode::Down) | (_, KeyCode::Char('j')) => {
-                            if state.tab == 1 && !state.history.is_empty() {
+                            if state.tab == 0 {
+                                // Dashboard: scroll Test Activity log forward one line.
+                                state.dashboard_log_scroll =
+                                    state.dashboard_log_scroll.saturating_sub(1);
+                            } else if state.tab == 1 && !state.history.is_empty() {
                                 if state.history_selected < state.history.len().saturating_sub(1) {
                                     state.history_selected += 1;
 
@@ -410,10 +390,17 @@ pub async fn run(args: Cli) -> Result<()> {
                             if state.tab == 1 && !state.history.is_empty() {
                                 let page_size = 20;
                                 state.history_selected = state.history_selected.saturating_sub(page_size);
+                            } else if state.tab == 0 {
+                                let max_scroll = state.text_log.len().saturating_sub(1);
+                                state.dashboard_log_scroll =
+                                    (state.dashboard_log_scroll + 10).min(max_scroll);
                             }
                         }
                         (_, KeyCode::PageDown) => {
-                            if state.tab == 1 && !state.history.is_empty() {
+                            if state.tab == 0 {
+                                state.dashboard_log_scroll =
+                                    state.dashboard_log_scroll.saturating_sub(10);
+                            } else if state.tab == 1 && !state.history.is_empty() {
                                 let page_size = 20;
                                 let max_idx = state.history.len().saturating_sub(1);
                                 state.history_selected = (state.history_selected + page_size).min(max_idx);
@@ -439,38 +426,6 @@ pub async fn run(args: Cli) -> Result<()> {
                                         }
                                     }
                                 }
-                            }
-                        }
-                        (_, KeyCode::Char('d')) => {
-                            if state.tab == 1 && !state.history.is_empty() {
-                                // history_selected directly maps to history index (newest first)
-                                if state.history_selected < state.history.len() {
-                                    let to_delete = state.history[state.history_selected].clone();
-                                    if let Err(e) = crate::storage::delete_run(&to_delete) {
-                                        state.info = format!("Delete failed: {e:#}");
-                                    } else {
-                                        state.history.remove(state.history_selected);
-                                        // Adjust scroll offset if needed
-                                        if state.history_scroll_offset >= state.history.len() && !state.history.is_empty() {
-                                            state.history_scroll_offset = state.history.len().saturating_sub(20).max(0);
-                                        }
-                                        // Adjust selection if needed
-                                        if state.history_selected >= state.history.len() && !state.history.is_empty() {
-                                            state.history_selected = state.history.len() - 1;
-                                        } else if state.history.is_empty() {
-                                            state.history_selected = 0;
-                                            state.history_scroll_offset = 0;
-                                        }
-                                        state.info = "Deleted".into();
-                                    }
-                                }
-                            }
-                        }
-                        // Enter key to view JSON detail (only on History tab)
-                        (_, KeyCode::Enter) => {
-                            if state.tab == 1 && !state.history.is_empty() {
-                                state.history_detail_view = true;
-                                state.history_detail_scroll = 0;
                             }
                         }
                         // Filter controls (only on History tab)
@@ -568,7 +523,9 @@ pub async fn run(args: Cli) -> Result<()> {
                         if let Some(ctx) = &mut run_ctx {
                             if let Some(h) = ctx.handle.take() {
                             match h.await {
-                                Ok(Ok(r)) => {
+                                Ok(Ok(mut r)) => {
+                                    r.connection_quality =
+                                        crate::quality::compute(&r, &state.dl_points, &state.ul_points);
                                     if state.auto_save {
                                         save_and_show_path(&r, &mut state);
                                     }
@@ -586,6 +543,19 @@ pub async fn run(args: Cli) -> Result<()> {
                                     // Enrich result with network info before storing
                                     let enriched = enrich_result_with_network_info(&r, &state);
                                     state.last_result = Some(enriched.clone());
+
+                                    // Emit the same end-of-run summary lines text mode prints into the
+                                    // dashboard's Test Activity panel so users see the final numbers.
+                                    for line in crate::event_format::format_result_summary(
+                                        &enriched,
+                                        &state.dl_points,
+                                        &state.ul_points,
+                                        &state.idle_latency_samples,
+                                        &state.loaded_dl_latency_samples,
+                                        &state.loaded_ul_latency_samples,
+                                    ) {
+                                        UiState::push_log_line(&mut state.text_log, line);
+                                    }
 
                                     // Handle command-line export flags
                                     let mut export_messages = Vec::new();
@@ -657,6 +627,25 @@ async fn start_run(args: &Cli) -> Result<RunCtx> {
 }
 
 fn apply_event(state: &mut UiState, ev: TestEvent) {
+    // Append the same lines text mode would print to the activity log.
+    let added = crate::event_format::format_event_lines(&ev);
+    if !added.is_empty() {
+        let added_count = added.len();
+        for line in added {
+            UiState::push_log_line(&mut state.text_log, line);
+        }
+        // If the user has scrolled away from the bottom, keep their view
+        // anchored on the same lines by pushing the offset out by the number
+        // of new lines. Scroll == 0 stays pinned to the newest (auto-follow).
+        if state.dashboard_log_scroll > 0 {
+            let max_scroll = state.text_log.len().saturating_sub(1);
+            state.dashboard_log_scroll = state
+                .dashboard_log_scroll
+                .saturating_add(added_count)
+                .min(max_scroll);
+        }
+    }
+
     match ev {
         TestEvent::PhaseStarted { phase } => {
             state.phase = phase;
@@ -885,6 +874,7 @@ fn apply_event(state: &mut UiState, ev: TestEvent) {
                 .map(|r| format!("{:.1}ms", r))
                 .unwrap_or_else(|| "*".to_string());
             state.info = format!("Traceroute hop {}: {} {}", hop_number, addr, rtt);
+            state.traceroute_hops.push(hop);
         }
         TestEvent::TracerouteComplete { summary } => {
             state.info = format!(
@@ -901,18 +891,307 @@ fn apply_event(state: &mut UiState, ev: TestEvent) {
     }
 }
 
+fn open_history_detail(state: &mut UiState) {
+    if state.history.is_empty() || state.history_selected >= state.history.len() {
+        return;
+    }
+    let r = &state.history[state.history_selected];
+    let json = serde_json::to_string_pretty(r)
+        .unwrap_or_else(|e| format!("Error serializing JSON: {}", e));
+    let lines: Vec<String> = json.lines().map(String::from).collect();
+    let mut textarea = ratatui_textarea::TextArea::new(if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    });
+    textarea.set_cursor_line_style(ratatui::style::Style::default());
+    state.history_detail_textarea = textarea;
+    state.history_detail_search.clear();
+    state.history_detail_search_editing = false;
+    state.history_detail_search_error = None;
+    state.history_detail_view = true;
+}
+
+fn close_history_detail(state: &mut UiState) {
+    state.history_detail_view = false;
+    state.history_detail_textarea = ratatui_textarea::TextArea::default();
+    state.history_detail_search.clear();
+    state.history_detail_search_editing = false;
+    state.history_detail_search_error = None;
+}
+
+fn apply_detail_search_pattern(state: &mut UiState) {
+    let pattern = state.history_detail_search.clone();
+    match state.history_detail_textarea.set_search_pattern(&pattern) {
+        Ok(_) => {
+            state.history_detail_search_error = None;
+            if !pattern.is_empty() {
+                state.history_detail_textarea.search_forward(false);
+            }
+        }
+        Err(e) => {
+            state.history_detail_search_error = Some(e.to_string());
+        }
+    }
+}
+
+fn handle_history_detail_key(state: &mut UiState, k: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+
+    if state.history_detail_search_editing {
+        match k.code {
+            KeyCode::Esc => {
+                // Cancel search input: clear pattern and exit editing mode.
+                state.history_detail_search.clear();
+                state.history_detail_search_editing = false;
+                state.history_detail_search_error = None;
+                let _ = state.history_detail_textarea.set_search_pattern("");
+            }
+            KeyCode::Enter => {
+                state.history_detail_search_editing = false;
+                apply_detail_search_pattern(state);
+            }
+            KeyCode::Backspace => {
+                state.history_detail_search.pop();
+                apply_detail_search_pattern(state);
+            }
+            KeyCode::Char(c) => {
+                state.history_detail_search.push(c);
+                apply_detail_search_pattern(state);
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match k.code {
+        KeyCode::Esc => {
+            if !state.history_detail_search.is_empty() {
+                // Active search: clear it instead of closing the view.
+                state.history_detail_search.clear();
+                state.history_detail_search_error = None;
+                let _ = state.history_detail_textarea.set_search_pattern("");
+            } else {
+                close_history_detail(state);
+            }
+        }
+        KeyCode::Char('q') => close_history_detail(state),
+        KeyCode::Char('/') => {
+            state.history_detail_search_editing = true;
+            state.history_detail_search_error = None;
+        }
+        KeyCode::Char('n') => {
+            if !state.history_detail_search.is_empty() {
+                state.history_detail_textarea.search_forward(false);
+            }
+        }
+        KeyCode::Char('N') => {
+            if !state.history_detail_search.is_empty() {
+                state.history_detail_textarea.search_back(false);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state
+                .history_detail_textarea
+                .move_cursor(ratatui_textarea::CursorMove::Up);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state
+                .history_detail_textarea
+                .move_cursor(ratatui_textarea::CursorMove::Down);
+        }
+        KeyCode::PageUp => {
+            state
+                .history_detail_textarea
+                .scroll(ratatui_textarea::Scrolling::PageUp);
+        }
+        KeyCode::PageDown => {
+            state
+                .history_detail_textarea
+                .scroll(ratatui_textarea::Scrolling::PageDown);
+        }
+        KeyCode::Home => {
+            state
+                .history_detail_textarea
+                .move_cursor(ratatui_textarea::CursorMove::Top);
+        }
+        KeyCode::End => {
+            state
+                .history_detail_textarea
+                .move_cursor(ratatui_textarea::CursorMove::Bottom);
+        }
+        _ => {}
+    }
+}
+
+fn open_export_modal(state: &mut UiState, path: String) {
+    state.history_export_modal_open = true;
+    state.history_export_modal_path = Some(path);
+    state.history_export_modal_copied = false;
+}
+
+fn export_history_selected_json(state: &mut UiState) {
+    if state.history.is_empty() || state.history_selected >= state.history.len() {
+        return;
+    }
+    let r = &state.history[state.history_selected];
+    match export_result_json(r, state) {
+        Ok(p) => open_export_modal(state, p.to_string_lossy().to_string()),
+        Err(e) => state.info = format!("JSON export failed: {e:#}"),
+    }
+}
+
+fn export_history_selected_csv(state: &mut UiState) {
+    if state.history.is_empty() || state.history_selected >= state.history.len() {
+        return;
+    }
+    let r = &state.history[state.history_selected];
+    match export_result_csv(r, state) {
+        Ok(p) => open_export_modal(state, p.to_string_lossy().to_string()),
+        Err(e) => state.info = format!("CSV export failed: {e:#}"),
+    }
+}
+
+fn open_comment_modal(state: &mut UiState) {
+    if state.history.is_empty() || state.history_selected >= state.history.len() {
+        return;
+    }
+    let existing = state.history[state.history_selected]
+        .comments
+        .clone()
+        .unwrap_or_default();
+    let lines = if existing.is_empty() {
+        vec![String::new()]
+    } else {
+        existing.lines().map(String::from).collect()
+    };
+    let mut textarea = ratatui_textarea::TextArea::new(lines);
+    textarea.move_cursor(ratatui_textarea::CursorMove::End);
+    // Disable the default underlined "current line" style — the textarea is single-line
+    // and the underline looks out of place.
+    textarea.set_cursor_line_style(ratatui::style::Style::default());
+    textarea.set_placeholder_text("Type a comment\u{2026}");
+    state.history_comment_modal_textarea = textarea;
+    state.history_comment_modal_open = true;
+}
+
+fn handle_history_comment_modal_key(state: &mut UiState, k: crossterm::event::KeyEvent) {
+    match k.code {
+        KeyCode::Esc => {
+            state.history_comment_modal_open = false;
+            state.history_comment_modal_textarea = ratatui_textarea::TextArea::default();
+        }
+        KeyCode::Enter => {
+            if state.history_selected < state.history.len() {
+                let value = state
+                    .history_comment_modal_textarea
+                    .lines()
+                    .join(" ")
+                    .trim()
+                    .to_string();
+                let new_comment = if value.is_empty() { None } else { Some(value) };
+                state.history[state.history_selected].comments = new_comment;
+                if let Err(e) = crate::storage::save_run(&state.history[state.history_selected]) {
+                    state.info = format!("Save comment failed: {e:#}");
+                } else {
+                    state.info = "Comment saved".into();
+                }
+            }
+            state.history_comment_modal_open = false;
+            state.history_comment_modal_textarea = ratatui_textarea::TextArea::default();
+        }
+        _ => {
+            // Delegate all other keys (arrows, Home/End, Backspace, Delete, characters)
+            // to the textarea widget.
+            state.history_comment_modal_textarea.input(Event::Key(k));
+        }
+    }
+}
+
+fn handle_history_export_modal_key(state: &mut UiState, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Enter => {
+            state.history_export_modal_open = false;
+        }
+        KeyCode::Char('c') => {
+            if let Some(ref path) = state.history_export_modal_path {
+                match copy_to_clipboard(path) {
+                    Ok(_) => state.history_export_modal_copied = true,
+                    Err(e) => state.info = format!("Clipboard copy failed: {e:#}"),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn delete_history_selected(state: &mut UiState) {
+    if state.history.is_empty() || state.history_selected >= state.history.len() {
+        return;
+    }
+    let to_delete = state.history[state.history_selected].clone();
+    if let Err(e) = crate::storage::delete_run(&to_delete) {
+        state.info = format!("Delete failed: {e:#}");
+        return;
+    }
+    state.history.remove(state.history_selected);
+    if state.history_scroll_offset >= state.history.len() && !state.history.is_empty() {
+        state.history_scroll_offset = state.history.len().saturating_sub(20).max(0);
+    }
+    if state.history_selected >= state.history.len() && !state.history.is_empty() {
+        state.history_selected = state.history.len() - 1;
+    } else if state.history.is_empty() {
+        state.history_selected = 0;
+        state.history_scroll_offset = 0;
+    }
+    state.info = "Deleted".into();
+}
+
+fn handle_history_menu_key(state: &mut UiState, code: KeyCode) {
+    let n = history::MENU_ITEM_COUNT;
+    match code {
+        KeyCode::Esc | KeyCode::Char(' ') => {
+            state.history_menu_open = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.history_menu_selected = (state.history_menu_selected + n - 1) % n;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.history_menu_selected = (state.history_menu_selected + 1) % n;
+        }
+        KeyCode::Enter => {
+            let idx = state.history_menu_selected;
+            state.history_menu_open = false;
+            match idx {
+                history::MENU_ITEM_VIEW => open_history_detail(state),
+                history::MENU_ITEM_EDIT_COMMENT => open_comment_modal(state),
+                history::MENU_ITEM_EXPORT_JSON => export_history_selected_json(state),
+                history::MENU_ITEM_EXPORT_CSV => export_history_selected_csv(state),
+                history::MENU_ITEM_DELETE => delete_history_selected(state),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 fn draw(area: Rect, f: &mut ratatui::Frame, state: &mut UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(area);
 
-    let tabs = Tabs::new(vec![
+    let mut tab_titles: Vec<Line> = vec![
         Line::from("Dashboard"),
         Line::from("History"),
-        Line::from("Charts"),
-        Line::from("Help"),
-    ])
+    ];
+    if state.traceroute_enabled {
+        tab_titles.push(Line::from("Traceroute"));
+    }
+    tab_titles.push(Line::from("Charts"));
+    tab_titles.push(Line::from("Help"));
+
+    let tabs = Tabs::new(tab_titles)
     .select(state.tab)
     .block(
         Block::default()
@@ -929,16 +1208,29 @@ fn draw(area: Rect, f: &mut ratatui::Frame, state: &mut UiState) {
     .highlight_style(Style::default().fg(Color::Yellow));
     f.render_widget(tabs, chunks[0]);
 
+    let traceroute_idx: Option<usize> = if state.traceroute_enabled { Some(2) } else { None };
+    let charts_idx: usize = if state.traceroute_enabled { 3 } else { 2 };
+
     match state.tab {
         0 => draw_dashboard(chunks[1], f, state),
         1 => {
             if state.history_detail_view {
                 draw_history_detail(chunks[1], f, &mut *state)
             } else {
-                show_history(chunks[1], f, &mut *state)
+                show_history(chunks[1], f, &mut *state);
+                if state.history_menu_open {
+                    draw_history_menu(chunks[1], f, &*state);
+                }
+                if state.history_export_modal_open {
+                    draw_history_export_modal(chunks[1], f, &*state);
+                }
+                if state.history_comment_modal_open {
+                    draw_history_comment_modal(chunks[1], f, &*state);
+                }
             }
         }
-        2 => draw_charts(chunks[1], f, state),
+        i if Some(i) == traceroute_idx => traceroute::draw_traceroute(chunks[1], f, state),
+        i if i == charts_idx => draw_charts(chunks[1], f, state),
         _ => draw_help(chunks[1], f),
     }
 }

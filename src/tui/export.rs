@@ -54,7 +54,10 @@ pub fn save_and_show_path(r: &RunResult, state: &mut UiState) {
             state.last_result = Some(enriched);
             // Verify file exists before showing path
             if path.exists() {
-                state.info = format!("Saved: {}", path.display());
+                let line = crate::event_format::format_saved_line(&path);
+                state.info = line.clone();
+                // Mirror text mode: log the same line to the Test Activity panel.
+                UiState::push_log_line(&mut state.text_log, line);
             } else {
                 state.info = format!("Saved (verifying): {}", path.display());
             }

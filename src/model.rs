@@ -263,6 +263,62 @@ pub struct RunResult {
     pub ip_comparison: Option<IpVersionComparison>,
     #[serde(default)]
     pub traceroute: Option<TracerouteSummary>,
+    #[serde(default)]
+    pub connection_quality: Option<ConnectionQuality>,
+}
+
+#[cfg(test)]
+pub(crate) fn empty_run_result() -> RunResult {
+    RunResult {
+        version: None,
+        timestamp_utc: String::new(),
+        base_url: String::new(),
+        meas_id: String::new(),
+        comments: None,
+        meta: None,
+        server: None,
+        idle_latency: LatencySummary::default(),
+        download: ThroughputSummary {
+            bytes: 0,
+            duration_ms: 0,
+            mbps: 0.0,
+            mean_mbps: None,
+            median_mbps: None,
+            p25_mbps: None,
+            p75_mbps: None,
+        },
+        upload: ThroughputSummary {
+            bytes: 0,
+            duration_ms: 0,
+            mbps: 0.0,
+            mean_mbps: None,
+            median_mbps: None,
+            p25_mbps: None,
+            p75_mbps: None,
+        },
+        loaded_latency_download: LatencySummary::default(),
+        loaded_latency_upload: LatencySummary::default(),
+        turn: None,
+        experimental_udp: None,
+        udp_error: None,
+        ip: None,
+        colo: None,
+        asn: None,
+        as_org: None,
+        interface_name: None,
+        network_name: None,
+        is_wireless: None,
+        interface_mac: None,
+        local_ipv4: None,
+        local_ipv6: None,
+        external_ipv4: None,
+        external_ipv6: None,
+        dns: None,
+        tls: None,
+        ip_comparison: None,
+        traceroute: None,
+        connection_quality: None,
+    }
 }
 
 // ============================================================================
@@ -324,4 +380,21 @@ pub struct TracerouteHop {
     pub hostname: Option<String>,
     pub rtt_ms: Vec<f64>,
     pub timeout: bool,
+}
+
+/// Derived connection-quality grades from a single run.
+///
+/// When one half is uncomputable but the other isn't:
+/// `bufferbloat_grade == "-"` (with `bufferbloat_ms == None`) means no bloat grade;
+/// `stability_grade == "-"` (with `stability_cv_pct == None`) means no stability grade.
+/// When both halves are uncomputable, `RunResult.connection_quality` is `None` and this
+/// struct is never constructed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionQuality {
+    pub bufferbloat_grade: String,
+    pub bufferbloat_ms: Option<f64>,
+    pub stability_grade: String,
+    pub stability_cv_pct: Option<f64>,
+    pub stability_cv_download_pct: Option<f64>,
+    pub stability_cv_upload_pct: Option<f64>,
 }

@@ -39,6 +39,11 @@ pub fn draw_help(area: Rect, f: &mut Frame) {
         ]),
         Line::from(vec![
             Span::raw("  "),
+            Span::styled("H", Style::default().fg(Color::Magenta)),
+            Span::raw("           Toggle redaction of identifying network info"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
             Span::styled("tab", Style::default().fg(Color::Magenta)),
             Span::raw("         Switch tabs"),
         ]),
@@ -51,30 +56,25 @@ pub fn draw_help(area: Rect, f: &mut Frame) {
         Line::from("History tab:"),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("↑/↓", Style::default().fg(Color::Magenta)),
+            Span::styled("\u{2191}/\u{2193}", Style::default().fg(Color::Magenta)),
             Span::raw(" or "),
             Span::styled("j/k", Style::default().fg(Color::Magenta)),
             Span::raw("  Navigate"),
         ]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("e", Style::default().fg(Color::Magenta)),
-            Span::raw("           Export selected as JSON"),
+            Span::styled("Enter", Style::default().fg(Color::Magenta)),
+            Span::raw("       Open JSON detail view"),
         ]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("c", Style::default().fg(Color::Magenta)),
-            Span::raw("           Export selected as CSV"),
+            Span::styled("Space", Style::default().fg(Color::Magenta)),
+            Span::raw("       Open actions menu (view, comment, export, delete)"),
         ]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("y", Style::default().fg(Color::Magenta)),
-            Span::raw("           Copy exported path to clipboard"),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("d", Style::default().fg(Color::Magenta)),
-            Span::raw("           Delete selected"),
+            Span::styled("/", Style::default().fg(Color::Magenta)),
+            Span::raw("           Filter history"),
         ]),
         Line::from(vec![
             Span::raw("  "),

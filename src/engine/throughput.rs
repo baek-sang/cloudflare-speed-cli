@@ -335,6 +335,16 @@ pub async fn run_upload_with_loaded_latency(
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    // Tick loop has ended — from the user's perspective the upload phase is over.
+    // Announce the next phase now so the dashboard updates immediately, even though
+    // the worker drain and latency probe await below may take a moment.
+    event_tx
+        .send(TestEvent::PhaseStarted {
+            phase: Phase::PacketLoss,
+        })
+        .await
+        .ok();
+
     stop.store(true, Ordering::Relaxed);
     for h in handles {
         let _ = h.await;
