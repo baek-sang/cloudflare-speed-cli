@@ -166,6 +166,8 @@ pub async fn run_download_with_loaded_latency(
             break;
         }
 
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         let now_total = total.load(Ordering::Relaxed);
         let dt = last_t.elapsed().as_secs_f64().max(1e-9);
         let dbytes = now_total.saturating_sub(last_bytes);
@@ -184,8 +186,6 @@ pub async fn run_download_with_loaded_latency(
             })
             .await
             .ok();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     stop.store(true, Ordering::Relaxed);
@@ -313,6 +313,8 @@ pub async fn run_upload_with_loaded_latency(
             break;
         }
 
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         let now_total = total.load(Ordering::Relaxed);
         let dt = last_t.elapsed().as_secs_f64().max(1e-9);
         let dbytes = now_total.saturating_sub(last_bytes);
@@ -331,8 +333,6 @@ pub async fn run_upload_with_loaded_latency(
             })
             .await
             .ok();
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     // Tick loop has ended — from the user's perspective the upload phase is over.
