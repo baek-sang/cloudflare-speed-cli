@@ -40,3 +40,8 @@ pub const GRADE_UNAVAILABLE: &str = "-";
 /// Minimum number of throughput samples required to compute a CV
 /// (stddev of fewer than 3 samples is meaningless).
 pub const MIN_STABILITY_SAMPLES: usize = 3;
+
+/// Cadence at which the download/upload loops sample cumulative bytes and emit
+/// a `ThroughputTick`. Also serves as the minimum steady-state window length:
+/// a window shorter than one full interval carries too little signal to report.
+pub const THROUGHPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);

@@ -1,3 +1,4 @@
+use crate::constants::THROUGHPUT_SAMPLE_INTERVAL;
 use crate::engine::cloudflare::CloudflareClient;
 use crate::engine::latency::run_latency_probes;
 use crate::engine::wait_if_paused_or_cancelled;
@@ -56,7 +57,7 @@ fn estimate_steady_window(
     let (t_start, b_start) = samples[start_idx];
     let (t_end, b_end) = *samples.last().unwrap();
     let dt = t_end.saturating_duration_since(t_start);
-    if dt.as_millis() < 200 {
+    if dt < THROUGHPUT_SAMPLE_INTERVAL {
         return None;
     }
     Some((b_end.saturating_sub(b_start), dt))
@@ -166,7 +167,7 @@ pub async fn run_download_with_loaded_latency(
             break;
         }
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(THROUGHPUT_SAMPLE_INTERVAL).await;
 
         let now_total = total.load(Ordering::Relaxed);
         let dt = last_t.elapsed().as_secs_f64().max(1e-9);
@@ -313,7 +314,7 @@ pub async fn run_upload_with_loaded_latency(
             break;
         }
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(THROUGHPUT_SAMPLE_INTERVAL).await;
 
         let now_total = total.load(Ordering::Relaxed);
         let dt = last_t.elapsed().as_secs_f64().max(1e-9);
