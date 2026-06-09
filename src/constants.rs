@@ -1,6 +1,14 @@
 //! Project-wide constants. Centralizes magic numbers so they are not
 //! duplicated across modules.
 
+use std::time::Duration;
+
+/// Per-connection TCP connect timeout for the speed-test HTTP client. Kept
+/// short so that when a family is pinned via `--ipv4-only` / `--ipv6-only` and
+/// that family has no working route, connects fail fast instead of stalling on
+/// the overall request timeout.
+pub const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Waveform-style bufferbloat thresholds: (max latency increase in ms, grade).
 /// The first row whose threshold the measured value is <= to wins.
 /// `f64::INFINITY` serves as the catch-all for F.

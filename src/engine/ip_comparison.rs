@@ -2,6 +2,7 @@
 //!
 //! Runs abbreviated speed tests on both IPv4 and IPv6 to compare performance.
 
+use super::network_bind::IpFamily;
 use crate::model::{IpVersionComparison, IpVersionResult};
 use anyhow::Result;
 use reqwest::Url;
@@ -21,6 +22,7 @@ pub async fn compare_ip_versions(
     user_agent: &str,
     bind_ip: Option<IpAddr>,
     cert_path: Option<&std::path::Path>,
+    family: Option<IpFamily>,
 ) -> Result<IpVersionComparison> {
     let url = Url::parse(base_url)?;
     let hostname = url
@@ -46,38 +48,54 @@ pub async fn compare_ip_versions(
         }
     }
 
+    // A run-wide restriction (--ipv4-only / --ipv6-only) wins over the
+    // comparison's "test both": skip the disabled family rather than connect
+    // on it, and explain why in the result.
+    let test_v4 = family != Some(IpFamily::V6);
+    let test_v6 = family != Some(IpFamily::V4);
+
     // Test IPv4
-    let ipv4_result = if let Some(ip) = ipv4_addr {
-        Some(test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip, cert_path).await)
+    let ipv4_result = Some(if !test_v4 {
+        skipped_result(family)
+    } else if let Some(ip) = ipv4_addr {
+        test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip, cert_path).await
     } else {
-        Some(IpVersionResult {
-            ip_address: "N/A".to_string(),
-            download_mbps: 0.0,
-            upload_mbps: 0.0,
-            latency_ms: 0.0,
-            available: false,
-            error: Some("No IPv4 address resolved".to_string()),
-        })
-    };
+        unavailable_result("No IPv4 address resolved")
+    });
 
     // Test IPv6
-    let ipv6_result = if let Some(ip) = ipv6_addr {
-        Some(test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip, cert_path).await)
+    let ipv6_result = Some(if !test_v6 {
+        skipped_result(family)
+    } else if let Some(ip) = ipv6_addr {
+        test_ip_version(base_url, hostname, port, ip, user_agent, bind_ip, cert_path).await
     } else {
-        Some(IpVersionResult {
-            ip_address: "N/A".to_string(),
-            download_mbps: 0.0,
-            upload_mbps: 0.0,
-            latency_ms: 0.0,
-            available: false,
-            error: Some("No IPv6 address resolved".to_string()),
-        })
-    };
+        unavailable_result("No IPv6 address resolved")
+    });
 
     Ok(IpVersionComparison {
         ipv4_result,
         ipv6_result,
     })
+}
+
+/// Result placeholder for a family that resolved no address.
+fn unavailable_result(error: &str) -> IpVersionResult {
+    IpVersionResult {
+        ip_address: "N/A".to_string(),
+        download_mbps: 0.0,
+        upload_mbps: 0.0,
+        latency_ms: 0.0,
+        available: false,
+        error: Some(error.to_string()),
+    }
+}
+
+/// Result placeholder for a family skipped because of `--ipvX-only`.
+fn skipped_result(family: Option<IpFamily>) -> IpVersionResult {
+    let reason = family
+        .map(|f| format!("Skipped ({} in effect)", f.flag()))
+        .unwrap_or_else(|| "Skipped".to_string());
+    unavailable_result(&reason)
 }
 
 /// Test a specific IP version by forcing requests to that IP.

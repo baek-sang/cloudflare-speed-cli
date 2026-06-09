@@ -1,5 +1,6 @@
 //! TLS handshake time measurement module
 
+use super::network_bind::IpFamily;
 use crate::model::TlsSummary;
 use anyhow::{anyhow, Context, Result};
 use rustls::pki_types::ServerName;
@@ -30,15 +31,17 @@ fn ensure_crypto_provider() {
 /// This measures only the TLS handshake, not including TCP connection time.
 /// Returns a `TlsSummary` with handshake time, protocol version, and cipher suite.
 ///
-/// When `bind_ip` is set, candidate addresses are filtered to the bind IP's
-/// family and the TCP socket is bound to that source IP before connect. This
-/// keeps the measurement on the same interface the rest of the test runs on
+/// Candidate addresses are filtered to `family` when set (from `--ipv4-only` /
+/// `--ipv6-only` or the bound source IP's family). When `bind_ip` is set, the
+/// TCP socket is bound to that source IP before connect, keeping the
+/// measurement on the same interface the rest of the test runs on
 /// (e.g. `--interface wg0`).
 pub async fn measure_tls_handshake(
     hostname: &str,
     port: u16,
     cert_path: Option<&std::path::Path>,
     bind_ip: Option<IpAddr>,
+    family: Option<IpFamily>,
 ) -> Result<TlsSummary> {
     // Ensure the crypto provider is installed
     ensure_crypto_provider();
@@ -68,7 +71,7 @@ pub async fn measure_tls_handshake(
     let connector = TlsConnector::from(Arc::new(config));
 
     // Resolve and connect, trying each address until one succeeds.
-    let tcp_stream = connect_tcp(hostname, port, bind_ip).await?;
+    let tcp_stream = connect_tcp(hostname, port, bind_ip, family).await?;
 
     // Parse server name for TLS
     let server_name: ServerName<'static> = hostname
@@ -101,13 +104,14 @@ pub async fn measure_tls_handshake(
 }
 
 /// Resolve `hostname:port` and connect to the first reachable address whose
-/// family matches `bind_ip` (or any family if `bind_ip` is None). Binds the
+/// family matches `family` (or any family if `family` is None). Binds the
 /// socket to `bind_ip` before connecting when set, and applies a per-address
 /// connect timeout so unreachable addresses don't stall the test.
 async fn connect_tcp(
     hostname: &str,
     port: u16,
     bind_ip: Option<IpAddr>,
+    family: Option<IpFamily>,
 ) -> Result<tokio::net::TcpStream> {
     let lookup_target = format!("{}:{}", hostname, port);
     let resolved: Vec<SocketAddr> = lookup_host(&lookup_target)
@@ -119,16 +123,17 @@ async fn connect_tcp(
         return Err(anyhow!("DNS returned no addresses for {}", hostname));
     }
 
-    // Filter by bind family if set; otherwise try all.
-    let candidates: Vec<SocketAddr> = match bind_ip {
-        Some(IpAddr::V4(_)) => resolved.iter().copied().filter(|a| a.is_ipv4()).collect(),
-        Some(IpAddr::V6(_)) => resolved.iter().copied().filter(|a| a.is_ipv6()).collect(),
+    // Filter by the requested family if set; otherwise try all. `family`
+    // already incorporates the bind IP's family, so binding stays consistent.
+    let candidates: Vec<SocketAddr> = match family {
+        Some(f) => resolved.iter().copied().filter(|a| f.matches(a.ip())).collect(),
         None => resolved.clone(),
     };
 
     if candidates.is_empty() {
         return Err(anyhow!(
-            "no resolved address for {} matches the bind IP family",
+            "no {} address resolved for {}",
+            family.map(|f| f.label()).unwrap_or("usable"),
             hostname
         ));
     }

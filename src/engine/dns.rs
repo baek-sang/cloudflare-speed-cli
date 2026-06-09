@@ -8,8 +8,15 @@ use tokio::net::lookup_host;
 
 /// Measure DNS resolution time for a given hostname.
 ///
-/// Returns a `DnsSummary` containing the resolution time and resolved IP addresses.
-pub async fn measure_dns_resolution(hostname: &str) -> Result<DnsSummary> {
+/// Returns a `DnsSummary` containing the resolution time and resolved IP
+/// addresses. When `family` restricts the run to one version (`--ipv4-only` /
+/// `--ipv6-only`), only addresses of that family are reported, keeping the DNS
+/// summary consistent with the rest of the run. The measured time still
+/// reflects the single system resolver call (which returns all families).
+pub async fn measure_dns_resolution(
+    hostname: &str,
+    family: Option<super::network_bind::IpFamily>,
+) -> Result<DnsSummary> {
     // Get system DNS servers
     let dns_servers = get_system_dns_servers();
 
@@ -33,6 +40,12 @@ pub async fn measure_dns_resolution(hostname: &str) -> Result<DnsSummary> {
 
     for addr in &addrs {
         let ip = addr.ip();
+        // Skip the disabled family under --ipv4-only / --ipv6-only.
+        if let Some(f) = family {
+            if !f.matches(ip) {
+                continue;
+            }
+        }
         resolved_ips.push(ip.to_string());
         match ip {
             IpAddr::V4(_) => ipv4_count += 1,
@@ -208,11 +221,18 @@ pub fn extract_hostname(url: &str) -> Option<String> {
 
 /// Fetch external IPv4 and IPv6 addresses by making requests to Cloudflare.
 /// Returns (ipv4, ipv6) - either may be None if not available.
+///
+/// When `family` restricts the run to one version (`--ipv4-only` /
+/// `--ipv6-only`), the other family's probe is skipped entirely rather than
+/// issued and left to time out.
 pub async fn fetch_external_ips(
     base_url: &str,
     bind_ip: Option<std::net::IpAddr>,
     cert_path: Option<&std::path::Path>,
+    family: Option<super::network_bind::IpFamily>,
 ) -> (Option<String>, Option<String>) {
+    use super::network_bind::IpFamily;
+
     let hostname = match extract_hostname(base_url) {
         Some(h) => h,
         None => return (None, None),
@@ -221,9 +241,24 @@ pub async fn fetch_external_ips(
     // Resolve to get IPv4 and IPv6 addresses
     let url = format!("{}/__down?bytes=0", base_url);
 
+    let want_v4 = family != Some(IpFamily::V6);
+    let want_v6 = family != Some(IpFamily::V4);
+
     let (ipv4, ipv6) = tokio::join!(
-        fetch_external_ip_version(&url, &hostname, IpVersion::V4, bind_ip, cert_path),
-        fetch_external_ip_version(&url, &hostname, IpVersion::V6, bind_ip, cert_path)
+        async {
+            if want_v4 {
+                fetch_external_ip_version(&url, &hostname, IpVersion::V4, bind_ip, cert_path).await
+            } else {
+                None
+            }
+        },
+        async {
+            if want_v6 {
+                fetch_external_ip_version(&url, &hostname, IpVersion::V6, bind_ip, cert_path).await
+            } else {
+                None
+            }
+        }
     );
 
     (ipv4, ipv6)

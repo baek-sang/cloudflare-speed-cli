@@ -12,7 +12,16 @@ pub struct CloudflareClient {
 }
 
 impl CloudflareClient {
-    pub fn new(cfg: &RunConfig) -> Result<Self> {
+    /// Build the shared HTTP client for the run.
+    ///
+    /// `family` is the effective IP-version restriction (see
+    /// [`super::network_bind::resolve_ip_family`]). When set, DNS resolution
+    /// for the base host is pinned to addresses of that family so every phase
+    /// (latency, download, upload) honors `--ipv4-only` / `--ipv6-only`.
+    pub async fn new(
+        cfg: &RunConfig,
+        family: Option<super::network_bind::IpFamily>,
+    ) -> Result<Self> {
         let base_url = Url::parse(&cfg.base_url).context("invalid base_url")?;
 
         let mut default_headers = reqwest::header::HeaderMap::new();
@@ -27,9 +36,32 @@ impl CloudflareClient {
             .user_agent(cfg.user_agent.clone())
             .default_headers(default_headers)
             .timeout(Duration::from_secs(30))
+            .connect_timeout(crate::constants::HTTP_CONNECT_TIMEOUT)
             .tcp_keepalive(Duration::from_secs(15));
 
         builder = network_bind::apply_local_address(builder, cfg.resolved_bind_ip);
+
+        // Pin DNS resolution to the requested family for --ipv4-only /
+        // --ipv6-only. A proxy resolves the target itself, so the override
+        // can't be enforced for the proxied throughput test; warn instead of
+        // failing silently.
+        if let Some(family) = family {
+            if cfg.proxy.is_some() {
+                // Only warn for an explicitly requested family. A family merely
+                // implied by --source/--interface is already pinned by the
+                // local socket bind above, so there is nothing to caveat.
+                if cfg.ipv4_only || cfg.ipv6_only {
+                    eprintln!(
+                        "Warning: {} can't be enforced on the throughput test when routing through a proxy; the proxy selects the address family to the target.",
+                        family.flag()
+                    );
+                }
+            } else if let Some(host) = base_url.host_str() {
+                let port = base_url.port_or_known_default().unwrap_or(443);
+                let addrs = network_bind::resolve_addrs_for_family(host, port, family).await?;
+                builder = builder.resolve_to_addrs(host, &addrs);
+            }
+        }
 
         // Load custom certificate if provided
         if let Some(ref cert_path) = cfg.certificate_path {

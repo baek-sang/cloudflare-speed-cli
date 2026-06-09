@@ -22,7 +22,7 @@ A CLI tool that displays network speed test results from Cloudflare's speed test
 - **Speed Tests**: Download/upload throughput, idle latency, and loaded latency
 - **Diagnostics**: DNS resolution and TLS handshake timing run alongside every test
 - **UDP Quality**: Packet loss, jitter, and MOS-style link scoring
-- **IPv4 vs IPv6**: Optional side-by-side comparison (`--compare-ip-versions`)
+- **IPv4 vs IPv6**: Optional side-by-side comparison (`--compare-ip-versions`), or force a single family with `-4`/`--ipv4-only` and `-6`/`--ipv6-only`
 - **Traceroute**: Optional ICMP traceroute to the Cloudflare edge (`--traceroute`)
 - **Proxy Support**: Route through HTTP, HTTPS, or SOCKS5 proxies (`--proxy`)
 - **TLS Trust**: Loads OS truststore, or supply a private CA with `--certificate`
