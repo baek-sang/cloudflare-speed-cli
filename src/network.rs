@@ -1,4 +1,5 @@
 use crate::cli::Cli;
+use crate::engine::network_bind::IpFamily;
 use crate::model::RunResult;
 use serde_json::Value;
 use std::process::Command;
@@ -82,8 +83,17 @@ pub fn gather_network_info(args: &Cli) -> NetworkInfo {
             let mac = get_interface_mac(iface);
             (Some(iface.clone()), network_name, is_wireless, mac)
         } else {
-            // Auto-detect default interface
-            gather_default_network_info()
+            // Auto-detect default interface. Under --ipv4-only / --ipv6-only,
+            // look up the default route for that family so the reported
+            // interface matches the one the test actually uses (these can be
+            // different NICs). No --interface/--source here, so the family is
+            // determined solely by the flags.
+            let family = match (args.ipv4_only, args.ipv6_only) {
+                (true, false) => Some(IpFamily::V4),
+                (false, true) => Some(IpFamily::V6),
+                _ => None,
+            };
+            gather_default_network_info(family)
         };
 
     let (local_ipv4, local_ipv6) = get_interface_ips(interface_name.as_deref());
@@ -98,10 +108,15 @@ pub fn gather_network_info(args: &Cli) -> NetworkInfo {
     }
 }
 
-/// Gather network interface information for the default interface
-fn gather_default_network_info() -> (Option<String>, Option<String>, Option<bool>, Option<String>) {
-    // Get default interface by trying to connect to a remote address
-    let interface_name = get_default_interface();
+/// Gather network interface information for the default interface.
+///
+/// `family` restricts the default-route lookup to a single address family
+/// (from `--ipv4-only` / `--ipv6-only`); `None` keeps the platform default.
+fn gather_default_network_info(
+    family: Option<IpFamily>,
+) -> (Option<String>, Option<String>, Option<bool>, Option<String>) {
+    // Look up the default-route interface for the requested family.
+    let interface_name = get_default_interface(family);
 
     if let Some(ref iface) = interface_name {
         let is_wireless = check_if_wireless(iface);
@@ -117,14 +132,19 @@ fn gather_default_network_info() -> (Option<String>, Option<String>, Option<bool
     }
 }
 
-/// Get the default network interface name
+/// Get the default network interface name for the given address family.
+/// `None` queries the IPv4 default route (the platform default).
 #[cfg(target_os = "linux")]
-fn get_default_interface() -> Option<String> {
+fn get_default_interface(family: Option<IpFamily>) -> Option<String> {
+    // `ip -6 route show default` for IPv6; the v4 table otherwise.
+    let route_args: &[&str] = if family == Some(IpFamily::V6) {
+        &["-6", "route", "show", "default"]
+    } else {
+        &["route", "show", "default"]
+    };
+
     // Try to get interface from default route
-    if let Ok(output) = Command::new("ip")
-        .args(&["route", "show", "default"])
-        .output()
-    {
+    if let Ok(output) = Command::new("ip").args(route_args).output() {
         if let Ok(output_str) = String::from_utf8(output.stdout) {
             // Look for "dev <interface>" in the output
             for line in output_str.lines() {
@@ -140,13 +160,20 @@ fn get_default_interface() -> Option<String> {
         }
     }
 
-    // Fallback: try to find first non-loopback interface
-    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str != "lo" && !name_str.starts_with("docker") && !name_str.starts_with("br-") {
-                return Some(name_str.to_string());
+    // Fallback: first non-loopback interface. Only when no specific family was
+    // requested, since this guess can't tell IPv4 from IPv6 interfaces and
+    // would be misleading under --ipv4-only / --ipv6-only.
+    if family.is_none() {
+        if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str != "lo"
+                    && !name_str.starts_with("docker")
+                    && !name_str.starts_with("br-")
+                {
+                    return Some(name_str.to_string());
+                }
             }
         }
     }
@@ -155,24 +182,46 @@ fn get_default_interface() -> Option<String> {
 }
 
 #[cfg(target_os = "freebsd")]
-fn get_default_interface() -> Option<String> {
+fn get_default_interface(family: Option<IpFamily>) -> Option<String> {
     let output = Command::new("netstat")
         .args(&["-rn", "--libxo=json"])
         .output()
         .ok()?;
 
     let output_str = String::from_utf8(output.stdout).ok()?;
-    let _v: Value = serde_json::from_str(&output_str).ok()?;
+    parse_default_iface_from_netstat_json(&output_str, family)
+}
 
-    if let Some(families) = _v["statistics"]["route-information"]["route-table"]["rt-family"].as_array() {
-        for family in families {
-            if let Some("Internet" | "Internet6") = family["address-family"].as_str() {
-                if let Some(entries) = family["rt-entry"].as_array() {
-                    for entry in entries {
-                        if entry["destination"].as_str() == Some("default") {
-                            let interface = entry["interface-name"].as_str();
-                            return Some(interface?.to_string());
-                        }
+/// Pick the default-route interface for `family` from FreeBSD
+/// `netstat -rn --libxo=json` output.
+///
+/// netstat labels the families "Internet" (IPv4) and "Internet6" (IPv6).
+/// Restricting to the requested one means that when the v4 and v6 default
+/// routes live on different interfaces we return the one the test actually
+/// uses, instead of whichever family netstat happens to list first.
+///
+/// Kept as a pure function (no command execution) and compiled in test builds
+/// on every platform so the parsing/selection can be unit-tested without a
+/// FreeBSD host.
+#[cfg(any(target_os = "freebsd", test))]
+fn parse_default_iface_from_netstat_json(json: &str, family: Option<IpFamily>) -> Option<String> {
+    let v: Value = serde_json::from_str(json).ok()?;
+
+    let af_matches = |af: Option<&str>| match family {
+        Some(IpFamily::V4) => af == Some("Internet"),
+        Some(IpFamily::V6) => af == Some("Internet6"),
+        None => matches!(af, Some("Internet" | "Internet6")),
+    };
+
+    let families =
+        v["statistics"]["route-information"]["route-table"]["rt-family"].as_array()?;
+
+    for family_entry in families {
+        if af_matches(family_entry["address-family"].as_str()) {
+            if let Some(entries) = family_entry["rt-entry"].as_array() {
+                for entry in entries {
+                    if entry["destination"].as_str() == Some("default") {
+                        return Some(entry["interface-name"].as_str()?.to_string());
                     }
                 }
             }
@@ -183,9 +232,16 @@ fn get_default_interface() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn get_default_interface() -> Option<String> {
-    // Use `route -n get default` to find the default interface
-    if let Ok(output) = Command::new("route").args(&["-n", "get", "default"]).output() {
+fn get_default_interface(family: Option<IpFamily>) -> Option<String> {
+    // `route -n get -inet6 default` for IPv6; the v4 default otherwise.
+    let route_args: &[&str] = if family == Some(IpFamily::V6) {
+        &["-n", "get", "-inet6", "default"]
+    } else {
+        &["-n", "get", "default"]
+    };
+
+    // Use `route -n get [-inet6] default` to find the default interface
+    if let Ok(output) = Command::new("route").args(route_args).output() {
         if output.status.success() {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 for line in output_str.lines() {
@@ -203,21 +259,25 @@ fn get_default_interface() -> Option<String> {
         }
     }
 
-    // Fallback: first non-loopback, non-tunnel interface from the system
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for iface in interfaces {
-            if iface.is_loopback() {
-                continue;
+    // Fallback: first non-loopback, non-tunnel interface. Only when no specific
+    // family was requested, since this guess can't distinguish IPv4 from IPv6
+    // interfaces and would mislead under --ipv4-only / --ipv6-only.
+    if family.is_none() {
+        if let Ok(interfaces) = if_addrs::get_if_addrs() {
+            for iface in interfaces {
+                if iface.is_loopback() {
+                    continue;
+                }
+                // Skip common virtual/tunnel interfaces
+                if iface.name.starts_with("utun")
+                    || iface.name.starts_with("awdl")
+                    || iface.name.starts_with("llw")
+                    || iface.name.starts_with("bridge")
+                {
+                    continue;
+                }
+                return Some(iface.name);
             }
-            // Skip common virtual/tunnel interfaces
-            if iface.name.starts_with("utun")
-                || iface.name.starts_with("awdl")
-                || iface.name.starts_with("llw")
-                || iface.name.starts_with("bridge")
-            {
-                continue;
-            }
-            return Some(iface.name);
         }
     }
 
@@ -225,13 +285,20 @@ fn get_default_interface() -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn get_default_interface() -> Option<String> {
+fn get_default_interface(family: Option<IpFamily>) -> Option<String> {
+    // The IPv6 default route is ::/0; the IPv4 default route is 0.0.0.0/0.
+    let dest_prefix = if family == Some(IpFamily::V6) {
+        "::/0"
+    } else {
+        "0.0.0.0/0"
+    };
+    let route_cmd = format!(
+        "Get-NetRoute -DestinationPrefix {} | Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias",
+        dest_prefix
+    );
+
     let output = Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-Command",
-            "Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty InterfaceAlias",
-        ])
+        .args(["-NoProfile", "-Command", route_cmd.as_str()])
         .output()
         .ok()?;
 
@@ -242,20 +309,23 @@ fn get_default_interface() -> Option<String> {
         }
     }
 
-    // Fallback: Get any active adapter
-    let output = Command::new("powershell")
-        .args(&[
-            "-NoProfile",
-            "-Command",
-            "Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1 -ExpandProperty InterfaceAlias",
-        ])
-        .output()
-        .ok()?;
+    // Fallback: any active adapter. Only when no specific family was requested,
+    // since this guess can't distinguish IPv4 from IPv6 interfaces.
+    if family.is_none() {
+        let output = Command::new("powershell")
+            .args(&[
+                "-NoProfile",
+                "-Command",
+                "Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1 -ExpandProperty InterfaceAlias",
+            ])
+            .output()
+            .ok()?;
 
-    if output.status.success() {
-        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !name.is_empty() {
-            return Some(name);
+        if output.status.success() {
+            let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
         }
     }
 
@@ -600,4 +670,107 @@ pub fn enrich_result(result: &RunResult, network_info: &NetworkInfo) -> RunResul
     // (no need to override)
 
     enriched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FreeBSD `netstat -rn --libxo=json` with the v4 and v6 default routes on
+    /// *separate* interfaces (em0 for IPv4, em1 for IPv6). This is the exact
+    /// scenario the bug report describes.
+    const NETSTAT_SEPARATE_IFACES: &str = r#"{
+      "statistics": {
+        "route-information": {
+          "route-table": {
+            "rt-family": [
+              {
+                "address-family": "Internet",
+                "rt-entry": [
+                  { "destination": "default", "gateway": "192.0.2.1", "interface-name": "em0" },
+                  { "destination": "192.0.2.0/24", "interface-name": "em0" }
+                ]
+              },
+              {
+                "address-family": "Internet6",
+                "rt-entry": [
+                  { "destination": "default", "gateway": "fe80::1", "interface-name": "em1" },
+                  { "destination": "fe80::/10", "interface-name": "em1" }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }"#;
+
+    #[test]
+    fn freebsd_picks_ipv4_default_iface() {
+        let iface = parse_default_iface_from_netstat_json(
+            NETSTAT_SEPARATE_IFACES,
+            Some(IpFamily::V4),
+        );
+        assert_eq!(iface.as_deref(), Some("em0"));
+    }
+
+    #[test]
+    fn freebsd_picks_ipv6_default_iface() {
+        let iface = parse_default_iface_from_netstat_json(
+            NETSTAT_SEPARATE_IFACES,
+            Some(IpFamily::V6),
+        );
+        assert_eq!(iface.as_deref(), Some("em1"));
+    }
+
+    #[test]
+    fn freebsd_no_family_returns_first_default() {
+        // With no restriction, fall back to the first family netstat lists.
+        let iface = parse_default_iface_from_netstat_json(NETSTAT_SEPARATE_IFACES, None);
+        assert_eq!(iface.as_deref(), Some("em0"));
+    }
+
+    #[test]
+    fn freebsd_requested_family_absent_returns_none() {
+        // Only an IPv4 default route exists; requesting IPv6 must not fall back
+        // to the IPv4 interface.
+        let v4_only = r#"{
+          "statistics": { "route-information": { "route-table": { "rt-family": [
+            { "address-family": "Internet", "rt-entry": [
+              { "destination": "default", "interface-name": "em0" }
+            ]}
+          ]}}}
+        }"#;
+        assert_eq!(
+            parse_default_iface_from_netstat_json(v4_only, Some(IpFamily::V6)),
+            None
+        );
+        assert_eq!(
+            parse_default_iface_from_netstat_json(v4_only, Some(IpFamily::V4)).as_deref(),
+            Some("em0")
+        );
+    }
+
+    #[test]
+    fn freebsd_no_default_route_returns_none() {
+        // A family present but with no "default" destination yields None.
+        let no_default = r#"{
+          "statistics": { "route-information": { "route-table": { "rt-family": [
+            { "address-family": "Internet", "rt-entry": [
+              { "destination": "192.0.2.0/24", "interface-name": "em0" }
+            ]}
+          ]}}}
+        }"#;
+        assert_eq!(
+            parse_default_iface_from_netstat_json(no_default, Some(IpFamily::V4)),
+            None
+        );
+    }
+
+    #[test]
+    fn freebsd_malformed_json_returns_none() {
+        assert_eq!(
+            parse_default_iface_from_netstat_json("not json", Some(IpFamily::V4)),
+            None
+        );
+    }
 }

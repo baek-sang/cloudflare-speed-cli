@@ -1,10 +1,10 @@
-use crate::engine::network_bind;
+use crate::engine::network_bind::{self, IpFamily};
 use crate::model::{ExperimentalUdpSummary, RunConfig, TestEvent, TurnInfo};
 use crate::stats::{latency_summary_from_samples, OnlineStats};
 use anyhow::{anyhow, Context, Result};
 use rand::RngCore;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -141,6 +141,7 @@ pub async fn run_udp_like_loss_probe(
     cfg: &RunConfig,
     event_tx: &mpsc::Sender<TestEvent>,
     pre_resolved: Vec<SocketAddr>,
+    family: Option<IpFamily>,
 ) -> Result<ExperimentalUdpSummary> {
     let target_url = pick_stun_target(turn).context("no stun/turn url in /__turn")?;
     let (host, port) = parse_host_port(&target_url)?;
@@ -158,18 +159,19 @@ pub async fn run_udp_like_loss_probe(
         return Err(anyhow!("dns returned no addresses for {}", host));
     }
 
-    // When a bind IP is set, only target addresses of the matching family are
-    // reachable: a UDP socket bound to a v4 source can't connect() to a v6
-    // peer (EAFNOSUPPORT) and vice versa.
-    let candidates: Vec<SocketAddr> = match cfg.resolved_bind_ip {
-        Some(IpAddr::V4(_)) => resolved.iter().copied().filter(|a| a.is_ipv4()).collect(),
-        Some(IpAddr::V6(_)) => resolved.iter().copied().filter(|a| a.is_ipv6()).collect(),
+    // Keep only target addresses of the requested family. `family` already
+    // folds in any bound source IP's family, and the match matters either way:
+    // a UDP socket bound to a v4 source can't connect() to a v6 peer
+    // (EAFNOSUPPORT) and vice versa.
+    let candidates: Vec<SocketAddr> = match family {
+        Some(f) => resolved.iter().copied().filter(|a| f.matches(a.ip())).collect(),
         None => resolved,
     };
 
     if candidates.is_empty() {
         return Err(anyhow!(
-            "no resolved address for {} matches the bind IP family",
+            "no {} address resolved for {}",
+            family.map(|f| f.label()).unwrap_or("usable"),
             host
         ));
     }

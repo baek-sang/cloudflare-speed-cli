@@ -52,7 +52,16 @@ impl TestEngine {
         event_tx: mpsc::Sender<TestEvent>,
         mut control_rx: mpsc::Receiver<EngineControl>,
     ) -> Result<RunResult> {
-        let client = cloudflare::CloudflareClient::new(&self.cfg)?;
+        // Effective IPv4/IPv6 restriction for the whole run. Validated in
+        // `build_config`, so this is expected to succeed here; recomputing
+        // keeps a single source of truth rather than threading a stored value.
+        let family = network_bind::resolve_ip_family(
+            self.cfg.ipv4_only,
+            self.cfg.ipv6_only,
+            self.cfg.resolved_bind_ip,
+        )?;
+
+        let client = cloudflare::CloudflareClient::new(&self.cfg, family).await?;
 
         let paused = Arc::new(AtomicBool::new(false));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -152,7 +161,7 @@ impl TestEngine {
                     .await
                     .ok();
 
-                match dns::measure_dns_resolution(&hostname).await {
+                match dns::measure_dns_resolution(&hostname, family).await {
                     Ok(summary) => {
                         event_tx
                             .send(TestEvent::DiagnosticDns {
@@ -189,6 +198,7 @@ impl TestEngine {
                     port,
                     self.cfg.certificate_path.as_deref(),
                     self.cfg.resolved_bind_ip,
+                    family,
                 )
                 .await
                 {
@@ -219,6 +229,7 @@ impl TestEngine {
                 &self.cfg.base_url,
                 self.cfg.resolved_bind_ip,
                 self.cfg.certificate_path.as_deref(),
+                family,
             )
             .await;
             external_ipv4 = v4.clone();
@@ -243,6 +254,7 @@ impl TestEngine {
                 &self.cfg.user_agent,
                 self.cfg.resolved_bind_ip,
                 self.cfg.certificate_path.as_deref(),
+                family,
             )
             .await
             {
@@ -285,6 +297,7 @@ impl TestEngine {
                     &event_tx,
                     self.cfg.resolved_bind_ip,
                     self.cfg.interface.as_deref(),
+                    family,
                 )
                 .await
                 {
@@ -386,7 +399,9 @@ impl TestEngine {
         // Use prefetched DNS if available (empty Vec means resolve inline)
         let pre_resolved: Vec<std::net::SocketAddr> = stun_dns_handle.await.unwrap_or_default();
 
-        match turn_udp::run_udp_like_loss_probe(&info, &self.cfg, &event_tx, pre_resolved).await {
+        match turn_udp::run_udp_like_loss_probe(&info, &self.cfg, &event_tx, pre_resolved, family)
+            .await
+        {
             Ok(udp) => {
                 experimental_udp = Some(udp);
             }

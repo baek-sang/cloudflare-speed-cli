@@ -1,0 +1,16 @@
+# CI-only Dockerfile used by .github/workflows/docker.yml.
+# It packages the prebuilt static musl binaries from the GitHub Release
+# instead of compiling from source (see Dockerfile for local builds).
+# Expects the workflow to place binaries at dist/<TARGETARCH>/cloudflare-speed-cli.
+ARG ALPINE_VERSION=3.21
+
+FROM alpine:${ALPINE_VERSION}
+
+RUN apk add --no-cache ca-certificates
+
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/cloudflare-speed-cli /usr/local/bin/cloudflare-speed-cli
+
+ENV TERM=xterm-256color
+
+ENTRYPOINT ["cloudflare-speed-cli"]

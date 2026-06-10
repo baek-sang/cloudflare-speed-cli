@@ -114,11 +114,11 @@ pub struct Cli {
     pub traceroute_max_hops: u8,
 
     /// Force IPv4 only (no IPv6)
-    #[arg(long)]
+    #[arg(short = '4', long, conflicts_with = "ipv6_only")]
     pub ipv4_only: bool,
 
     /// Force IPv6 only (no IPv4)
-    #[arg(long)]
+    #[arg(short = '6', long)]
     pub ipv6_only: bool,
 
     /// Skip default diagnostic measurements (DNS, TLS)
@@ -203,6 +203,11 @@ pub fn build_config(args: &Cli) -> Result<RunConfig> {
             eprintln!("Binding HTTP connections to source IP: {}", ip);
         }
     }
+
+    // Validate the IP-version selection up front so contradictions (both
+    // --ipv4-only and --ipv6-only, or a flag that disagrees with the bound
+    // source IP's family) fail before the test starts rather than mid-run.
+    network_bind::resolve_ip_family(args.ipv4_only, args.ipv6_only, resolved_bind_ip)?;
 
     Ok(RunConfig {
         base_url: args.base_url.clone(),
