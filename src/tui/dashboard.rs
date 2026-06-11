@@ -27,6 +27,24 @@ fn show_or_redact<'a>(value: Option<&'a str>, hide: bool) -> &'a str {
     }
 }
 
+/// Display value for an "External IPv4"/"External IPv6" panel row: the probe
+/// result when available, otherwise the meta client IP. The fallback must stay
+/// family-checked — a `-4`/`-6` run skips the other family's probe, and the
+/// client IP would otherwise show up on the wrong row.
+fn external_ip_for_family<'a>(
+    external: Option<&'a str>,
+    meta_ip: Option<&'a str>,
+    want_ipv4: bool,
+) -> Option<&'a str> {
+    external.or_else(|| {
+        meta_ip.filter(|ip| {
+            ip.parse::<std::net::IpAddr>()
+                .map(|addr| addr.is_ipv4() == want_ipv4)
+                .unwrap_or(false)
+        })
+    })
+}
+
 /// Redacts identifying info from a single Test Activity log line.
 ///
 /// Strategy: substring-replace values the engine already populated into `state`
@@ -777,25 +795,34 @@ pub fn draw_dashboard(area: Rect, f: &mut Frame, state: &UiState) {
     }
     network_lines.push(Line::from(your_network));
 
-    let external_ipv4_display = if hide {
-        REDACTED_PLACEHOLDER.to_string()
-    } else {
-        state
-            .external_ipv4
-            .as_deref()
-            .unwrap_or(state.ip.as_deref().unwrap_or("-"))
-            .to_string()
-    };
-
     network_lines.extend(vec![
         Line::from(vec![
             Span::styled("External IPv4: ", Style::default().fg(Color::Gray)),
-            Span::styled(external_ipv4_display, Style::default().fg(Color::Green)),
+            Span::styled(
+                show_or_redact(
+                    external_ip_for_family(
+                        state.external_ipv4.as_deref(),
+                        state.ip.as_deref(),
+                        true,
+                    ),
+                    hide,
+                )
+                .to_string(),
+                Style::default().fg(Color::Green),
+            ),
         ]),
         Line::from(vec![
             Span::styled("External IPv6: ", Style::default().fg(Color::Gray)),
             Span::styled(
-                show_or_redact(state.external_ipv6.as_deref(), hide).to_string(),
+                show_or_redact(
+                    external_ip_for_family(
+                        state.external_ipv6.as_deref(),
+                        state.ip.as_deref(),
+                        false,
+                    ),
+                    hide,
+                )
+                .to_string(),
                 Style::default().fg(Color::Cyan),
             ),
         ]),
@@ -1302,4 +1329,47 @@ pub fn draw_dashboard_compact(area: Rect, f: &mut Frame, state: &UiState) {
             ),
     );
     f.render_widget(meta, bottom_row[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_ip_prefers_probe_result() {
+        assert_eq!(
+            external_ip_for_family(Some("1.2.3.4"), Some("2001:db8::1"), true),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            external_ip_for_family(Some("2001:db8::1"), Some("1.2.3.4"), false),
+            Some("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn external_ip_falls_back_to_meta_ip_of_same_family() {
+        assert_eq!(
+            external_ip_for_family(None, Some("1.2.3.4"), true),
+            Some("1.2.3.4")
+        );
+        assert_eq!(
+            external_ip_for_family(None, Some("2001:db8::1"), false),
+            Some("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn external_ip_ignores_meta_ip_of_other_family() {
+        // --ipv6-only: the v4 probe is skipped and the meta client IP is the
+        // IPv6 address; it must not appear on the IPv4 row (issue #49).
+        assert_eq!(external_ip_for_family(None, Some("2001:db8::1"), true), None);
+        assert_eq!(external_ip_for_family(None, Some("1.2.3.4"), false), None);
+    }
+
+    #[test]
+    fn external_ip_handles_missing_or_invalid_meta_ip() {
+        assert_eq!(external_ip_for_family(None, None, true), None);
+        assert_eq!(external_ip_for_family(None, Some("not-an-ip"), true), None);
+    }
 }
